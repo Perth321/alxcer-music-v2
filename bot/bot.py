@@ -10,19 +10,27 @@ FFMPEG_OPTIONS = {
     'options': '-vn'
 }
 
-# android client confirmed working (tested) — tv_embedded as fallback
-YDL_OPTIONS = {
-    'format': 'bestaudio/best',
-    'quiet': True,
-    'no_warnings': True,
-    'noplaylist': True,
-    'source_address': '0.0.0.0',
-    'extractor_args': {
-        'youtube': {
-            'player_client': ['android', 'tv_embedded'],
-        }
-    },
-}
+COOKIES_FILE = os.path.join(os.path.dirname(__file__), 'cookies.txt')
+
+def make_ydl_opts():
+    opts = {
+        'format': 'bestaudio/best',
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': True,
+        'source_address': '0.0.0.0',
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'tv_embedded'],
+            }
+        },
+    }
+    if os.path.exists(COOKIES_FILE):
+        opts['cookiefile'] = COOKIES_FILE
+        print('[INFO] Using YouTube cookies file')
+    else:
+        print('[WARN] No cookies.txt found — YouTube may block playback on this IP')
+    return opts
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -59,7 +67,7 @@ async def fetch_track(query: str) -> dict:
     search = query.strip() if is_url(query) else f'ytsearch1:{query}'
 
     def _run():
-        with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
+        with yt_dlp.YoutubeDL(make_ydl_opts()) as ydl:
             data = ydl.extract_info(search, download=False)
             if 'entries' in data:
                 data = data['entries'][0]
@@ -124,7 +132,7 @@ async def on_command_error(ctx: commands.Context, error):
     if isinstance(error, commands.CommandNotFound):
         return
     if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f'⚠️ ใส่ชื่อเพลงหรือ link ด้วย เช่น `!play จี๋หอย`')
+        await ctx.send('⚠️ ใส่ชื่อเพลงหรือ link ด้วย เช่น `!play จี๋หอย`')
         return
     await ctx.send(f'⚠️ Error: `{error}`')
 
@@ -194,7 +202,6 @@ async def show_queue(ctx: commands.Context):
             value=f'**{np["title"]}**  `{fmt_duration(np["duration"])}`',
             inline=False,
         )
-
     if queue:
         lines = []
         for i, t in enumerate(queue[:10], 1):
