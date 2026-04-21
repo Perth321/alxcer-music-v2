@@ -11,7 +11,7 @@ permissions:
 
 concurrency:
   group: discord-bot
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   run-bot:
@@ -34,9 +34,10 @@ jobs:
 
       - name: Install dependencies
         run: |
+          pip install --upgrade pip
           pip install -r bot/requirements.txt
 
-      - name: Write YouTube cookies
+      - name: Write YouTube cookies (optional)
         env:
           YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
         run: |
@@ -44,7 +45,7 @@ jobs:
             printf '%s' "$YOUTUBE_COOKIES" > bot/cookies.txt
             echo "cookies.txt written ($(wc -c < bot/cookies.txt) bytes)"
           else
-            echo "No YOUTUBE_COOKIES secret — YouTube may block this IP"
+            echo "No YOUTUBE_COOKIES — using anonymous extractor clients"
           fi
 
       - name: Run Discord Music Bot
@@ -53,12 +54,20 @@ jobs:
         run: |
           python bot/bot.py
 
-      - name: Auto-restart after crash
-        if: ${{ failure() }}
+      - name: Auto-restart after exit
+        if: ${{ always() }}
+        env:
+          BOT_PAT: ${{ secrets.BOT_PAT }}
         run: |
-          echo "Bot crashed, triggering restart..."
-          curl -s -X POST \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/discord-bot.yml/dispatches \
+          if [ -z "$BOT_PAT" ]; then
+            echo "BOT_PAT not set — cannot self-restart"
+            exit 0
+          fi
+          echo "Re-dispatching workflow..."
+          curl -sS -X POST \
+            -H "Authorization: Bearer $BOT_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/discord-bot.yml/dispatches" \
             -d '{"ref":"main"}'
+          echo "Restart dispatched"
