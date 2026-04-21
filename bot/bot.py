@@ -10,16 +10,16 @@ FFMPEG_OPTIONS = {
     'options': '-vn'
 }
 
-# iOS client bypasses YouTube bot detection on server environments
+# android client confirmed working (tested) — tv_embedded as fallback
 YDL_OPTIONS = {
-    'format': 'bestaudio[ext=m4a]/bestaudio/best',
+    'format': 'bestaudio/best',
     'quiet': True,
     'no_warnings': True,
     'noplaylist': True,
     'source_address': '0.0.0.0',
     'extractor_args': {
         'youtube': {
-            'player_client': ['ios'],
+            'player_client': ['android', 'tv_embedded'],
         }
     },
 }
@@ -55,14 +55,12 @@ def fmt_duration(seconds) -> str:
 
 
 async def fetch_track(query: str) -> dict:
-    """Extract track info using yt-dlp. Works with both URLs and search terms."""
     loop = asyncio.get_event_loop()
     search = query.strip() if is_url(query) else f'ytsearch1:{query}'
 
     def _run():
         with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
             data = ydl.extract_info(search, download=False)
-            # ytsearch returns a list under 'entries'
             if 'entries' in data:
                 data = data['entries'][0]
             return {
@@ -77,7 +75,7 @@ async def fetch_track(query: str) -> dict:
     return await loop.run_in_executor(None, _run)
 
 
-def make_now_playing_embed(track: dict) -> discord.Embed:
+def make_np_embed(track: dict) -> discord.Embed:
     embed = discord.Embed(
         title='🎵 กำลังเล่นเพลง',
         description=f'**[{track["title"]}]({track["webpage_url"]})**',
@@ -91,12 +89,11 @@ def make_now_playing_embed(track: dict) -> discord.Embed:
 
 
 async def play_next(ctx: commands.Context):
-    """Play the next track in queue. Called automatically after each song ends."""
     queue = get_queue(ctx.guild.id)
     if not queue:
         now_playing.pop(ctx.guild.id, None)
-        if ctx.voice_client:
-            await ctx.send('✅ เล่นเพลงครบทุกเพลงแล้ว')
+        if ctx.voice_client and ctx.voice_client.is_connected():
+            await ctx.send('✅ เล่นครบทุกเพลงแล้ว')
         return
 
     track = queue.pop(0)
@@ -108,18 +105,15 @@ async def play_next(ctx: commands.Context):
             source,
             after=lambda _: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop),
         )
-        # Auto-show now playing embed every time a song starts
-        await ctx.send(embed=make_now_playing_embed(track))
+        await ctx.send(embed=make_np_embed(track))
     except Exception as e:
-        await ctx.send(f'⚠️ เล่นเพลงไม่ได้: `{e}`\nข้ามไปเพลงถัดไป...')
+        await ctx.send(f'⚠️ เล่นไม่ได้: `{e}`\nข้ามเพลงถัดไป...')
         asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
 
 
-# ─── Events ────────────────────────────────────────────────────────────────────
-
 @bot.event
 async def on_ready():
-    print(f'[OK] Bot online: {bot.user}  (ID: {bot.user.id})')
+    print(f'[OK] {bot.user} online (ID: {bot.user.id})')
     await bot.change_presence(
         activity=discord.Activity(type=discord.ActivityType.listening, name='!play')
     )
@@ -130,18 +124,15 @@ async def on_command_error(ctx: commands.Context, error):
     if isinstance(error, commands.CommandNotFound):
         return
     if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f'⚠️ ขาด argument: `{error.param.name}`')
+        await ctx.send(f'⚠️ ใส่ชื่อเพลงหรือ link ด้วย เช่น `!play จี๋หอย`')
         return
-    await ctx.send(f'⚠️ เกิดข้อผิดพลาด: `{error}`')
+    await ctx.send(f'⚠️ Error: `{error}`')
 
-
-# ─── Commands ──────────────────────────────────────────────────────────────────
 
 @bot.command(name='play', aliases=['p'])
 async def play(ctx: commands.Context, *, query: str):
-    """เล่นเพลงจากชื่อเพลงหรือ YouTube link"""
     if not ctx.author.voice:
-        await ctx.send('❌ คุณต้องเข้า voice channel ก่อน!')
+        await ctx.send('❌ เข้า voice channel ก่อนนะ!')
         return
 
     vc = ctx.voice_client
@@ -161,7 +152,6 @@ async def play(ctx: commands.Context, *, query: str):
     queue = get_queue(ctx.guild.id)
 
     if vc.is_playing() or vc.is_paused():
-        # Add to queue
         queue.append(track)
         embed = discord.Embed(
             title='✅ เพิ่มเข้าคิวแล้ว',
@@ -174,29 +164,26 @@ async def play(ctx: commands.Context, *, query: str):
             embed.set_thumbnail(url=track['thumbnail'])
         await status.edit(content=None, embed=embed)
     else:
-        # Play immediately — show now playing embed automatically
         now_playing[ctx.guild.id] = track
         source = discord.FFmpegPCMAudio(track['url'], **FFMPEG_OPTIONS)
         vc.play(
             source,
             after=lambda _: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop),
         )
-        await status.edit(content=None, embed=make_now_playing_embed(track))
+        await status.edit(content=None, embed=make_np_embed(track))
 
 
 @bot.command(name='skip', aliases=['s'])
 async def skip(ctx: commands.Context):
-    """ข้ามเพลงปัจจุบัน"""
     if ctx.voice_client and (ctx.voice_client.is_playing() or ctx.voice_client.is_paused()):
         ctx.voice_client.stop()
         await ctx.send('⏭️ ข้ามเพลงแล้ว')
     else:
-        await ctx.send('❌ ไม่มีเพลงเล่นอยู่ตอนนี้')
+        await ctx.send('❌ ไม่มีเพลงเล่นอยู่')
 
 
 @bot.command(name='queue', aliases=['q'])
 async def show_queue(ctx: commands.Context):
-    """ดูคิวเพลงทั้งหมด"""
     queue = get_queue(ctx.guild.id)
     np = now_playing.get(ctx.guild.id)
     embed = discord.Embed(title='📋 คิวเพลง', color=0x5865F2)
@@ -223,17 +210,15 @@ async def show_queue(ctx: commands.Context):
 
 @bot.command(name='np', aliases=['nowplaying'])
 async def nowplaying(ctx: commands.Context):
-    """แสดงเพลงที่กำลังเล่นอยู่"""
     track = now_playing.get(ctx.guild.id)
     if not track:
-        await ctx.send('❌ ไม่มีเพลงเล่นอยู่ตอนนี้')
+        await ctx.send('❌ ไม่มีเพลงเล่นอยู่')
         return
-    await ctx.send(embed=make_now_playing_embed(track))
+    await ctx.send(embed=make_np_embed(track))
 
 
 @bot.command(name='pause')
 async def pause(ctx: commands.Context):
-    """หยุดเพลงชั่วคราว"""
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.pause()
         await ctx.send('⏸️ หยุดชั่วคราว')
@@ -243,7 +228,6 @@ async def pause(ctx: commands.Context):
 
 @bot.command(name='resume')
 async def resume(ctx: commands.Context):
-    """เล่นเพลงต่อ"""
     if ctx.voice_client and ctx.voice_client.is_paused():
         ctx.voice_client.resume()
         await ctx.send('▶️ เล่นต่อแล้ว')
@@ -253,14 +237,12 @@ async def resume(ctx: commands.Context):
 
 @bot.command(name='clear', aliases=['cl'])
 async def clear_queue(ctx: commands.Context):
-    """ล้างคิวเพลงทั้งหมด"""
     queues[ctx.guild.id] = []
-    await ctx.send('🗑️ ล้างคิวเพลงแล้ว')
+    await ctx.send('🗑️ ล้างคิวแล้ว')
 
 
 @bot.command(name='leave', aliases=['dc', 'disconnect'])
 async def leave(ctx: commands.Context):
-    """บอทออกจาก voice channel"""
     if ctx.voice_client:
         queues[ctx.guild.id] = []
         now_playing.pop(ctx.guild.id, None)
@@ -272,37 +254,29 @@ async def leave(ctx: commands.Context):
 
 @bot.command(name='stop')
 async def stop(ctx: commands.Context):
-    """หยุดเพลงและออกจาก voice channel"""
     if ctx.voice_client:
         queues[ctx.guild.id] = []
         now_playing.pop(ctx.guild.id, None)
         ctx.voice_client.stop()
         await ctx.voice_client.disconnect()
-        await ctx.send('⏹️ หยุดเพลงและออกจาก voice channel แล้ว')
+        await ctx.send('⏹️ หยุดและออกจาก voice channel แล้ว')
     else:
         await ctx.send('❌ บอทไม่ได้อยู่ใน voice channel')
 
 
 @bot.command(name='help', aliases=['h', 'commands'])
 async def help_cmd(ctx: commands.Context):
-    """แสดงคำสั่งทั้งหมด"""
-    embed = discord.Embed(title='🎵 คำสั่ง Music Bot', color=0x5865F2)
-    cmds = [
-        ('!play <ชื่อเพลง หรือ YouTube link>', 'เล่นเพลง — ใส่ชื่อเพลงหรือวาง link ก็ได้'),
-        ('!skip  (!s)', 'ข้ามเพลงปัจจุบัน'),
-        ('!queue  (!q)', 'ดูคิวเพลงทั้งหมด + เพลงที่กำลังเล่น'),
-        ('!np', 'ดูเพลงที่กำลังเล่นอยู่'),
-        ('!pause / !resume', 'หยุดชั่วคราว / เล่นต่อ'),
-        ('!clear', 'ล้างคิวเพลง'),
-        ('!leave  (!dc)', 'บอทออกจาก voice channel'),
-        ('!stop', 'หยุดเพลง + ออก voice channel'),
-    ]
-    for name, value in cmds:
-        embed.add_field(name=name, value=value, inline=False)
+    embed = discord.Embed(title='🎵 คำสั่งทั้งหมด', color=0x5865F2)
+    embed.add_field(name='!play <ชื่อเพลง หรือ link>', value='เล่นเพลง / เพิ่มเข้าคิว', inline=False)
+    embed.add_field(name='!skip  (!s)', value='ข้ามเพลง', inline=False)
+    embed.add_field(name='!queue  (!q)', value='ดูคิวเพลง', inline=False)
+    embed.add_field(name='!np', value='ดูเพลงที่เล่นอยู่', inline=False)
+    embed.add_field(name='!pause / !resume', value='หยุดชั่วคราว / เล่นต่อ', inline=False)
+    embed.add_field(name='!clear', value='ล้างคิว', inline=False)
+    embed.add_field(name='!leave  (!dc)', value='ออกจาก voice channel', inline=False)
+    embed.add_field(name='!stop', value='หยุดเพลง + ออก voice channel', inline=False)
     await ctx.send(embed=embed)
 
-
-# ─── Run ───────────────────────────────────────────────────────────────────────
 
 TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
 if not TOKEN:
