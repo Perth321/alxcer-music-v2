@@ -39,26 +39,33 @@ COOKIES_FILE = os.path.join(os.path.dirname(__file__), 'cookies.txt')
 
 PIPED_INSTANCES = [
     'https://pipedapi.kavin.rocks',
-    'https://pipedapi.adminforge.de',
     'https://pipedapi.r4fo.com',
+    'https://pipedapi.adminforge.de',
+    'https://pipedapi.darkness.services',
     'https://pipedapi.leptons.xyz',
     'https://api.piped.private.coffee',
-    'https://pipedapi.darkness.services',
+    'https://pipedapi.reallyaweso.me',
+    'https://pipedapi.smnz.de',
+    'https://api-piped.mha.fi',
 ]
 
 INVIDIOUS_INSTANCES = [
     'https://invidious.nerdvpn.de',
-    'https://inv.nadeko.net',
     'https://invidious.privacyredirect.com',
+    'https://iv.melmac.space',
+    'https://inv.nadeko.net',
+    'https://invidious.materialio.us',
     'https://invidious.f5.si',
+    'https://invidious.jing.rocks',
+    'https://yewtu.be',
 ]
 
 YT_CLIENT_FALLBACKS = [
-    ['ios'],
+    ['web', 'android', 'ios', 'mweb', 'tv_embedded', 'web_embedded'],
     ['android_vr'],
-    ['mweb'],
-    ['tv_embedded'],
+    ['tv'],
     ['web_safari'],
+    ['ios'],
     ['android'],
 ]
 
@@ -201,9 +208,9 @@ async def fetch_track(query):
 
     def _run():
         errors = []
-        for fn, name in [(fetch_via_piped, 'piped'),
-                         (fetch_via_invidious, 'invidious'),
-                         (fetch_via_ytdlp, 'ytdlp')]:
+        for fn, name in [(fetch_via_ytdlp, 'ytdlp'),
+                         (fetch_via_piped, 'piped'),
+                         (fetch_via_invidious, 'invidious')]:
             try:
                 return fn(query)
             except Exception as e:
