@@ -15,7 +15,6 @@ FFMPEG_OPTIONS = {
 
 COOKIES_FILE = os.path.join(os.path.dirname(__file__), 'cookies.txt')
 
-# Public Piped API instances (proxy YouTube — bypass cloud-IP blocks)
 PIPED_INSTANCES = [
     'https://pipedapi.kavin.rocks',
     'https://pipedapi.adminforge.de',
@@ -25,7 +24,6 @@ PIPED_INSTANCES = [
     'https://pipedapi.darkness.services',
 ]
 
-# Public Invidious API instances (also proxy YouTube)
 INVIDIOUS_INSTANCES = [
     'https://invidious.nerdvpn.de',
     'https://inv.nadeko.net',
@@ -77,7 +75,7 @@ def make_ydl_opts(client):
 
 
 def fetch_via_ytdlp(query):
-    search = query.strip() if re.match(r'https?://', query.strip()) else f'ytsearch1:{query}'
+    search = query.strip() if re.match(r'https?://', query.strip()) else 'ytsearch1:' + query
     last_err = None
     for client in YT_CLIENT_FALLBACKS:
         try:
@@ -89,7 +87,7 @@ def fetch_via_ytdlp(query):
                     data = data['entries'][0]
                 if not data.get('url'):
                     raise RuntimeError('no stream url')
-                print(f'[OK] ytdlp client={client}')
+                print('[OK] ytdlp client=' + str(client))
                 return {
                     'url': data['url'],
                     'title': data.get('title', 'Unknown'),
@@ -100,8 +98,8 @@ def fetch_via_ytdlp(query):
                 }
         except Exception as e:
             last_err = e
-            print(f'[WARN] ytdlp client={client}: {e}')
-    raise RuntimeError(f'ytdlp failed all clients: {last_err}')
+            print('[WARN] ytdlp client=' + str(client) + ': ' + str(e))
+    raise RuntimeError('ytdlp failed all clients: ' + str(last_err))
 
 
 def fetch_via_piped(query):
@@ -110,11 +108,10 @@ def fetch_via_piped(query):
     for inst in PIPED_INSTANCES:
         try:
             if not vid:
-                # search
-                s = http_get_json(f'{inst}/search?q={urllib.parse.quote(query)}&filter=music_songs')
+                s = http_get_json(inst + '/search?q=' + urllib.parse.quote(query) + '&filter=music_songs')
                 items = s.get('items') or []
                 if not items:
-                    s = http_get_json(f'{inst}/search?q={urllib.parse.quote(query)}&filter=videos')
+                    s = http_get_json(inst + '/search?q=' + urllib.parse.quote(query) + '&filter=videos')
                     items = s.get('items') or []
                 if not items:
                     raise RuntimeError('no search results')
@@ -122,25 +119,25 @@ def fetch_via_piped(query):
                 vid_local = first['url'].split('v=')[-1].split('&')[0]
             else:
                 vid_local = vid
-            streams = http_get_json(f'{inst}/streams/{vid_local}')
+            streams = http_get_json(inst + '/streams/' + vid_local)
             audio = streams.get('audioStreams') or []
             if not audio:
                 raise RuntimeError('no audio streams')
             audio.sort(key=lambda a: a.get('bitrate', 0), reverse=True)
             best = audio[0]
-            print(f'[OK] piped via {inst}')
+            print('[OK] piped via ' + inst)
             return {
                 'url': best['url'],
                 'title': streams.get('title', 'Unknown'),
                 'duration': streams.get('duration', 0),
                 'thumbnail': streams.get('thumbnailUrl'),
-                'webpage_url': f'https://youtube.com/watch?v={vid_local}',
+                'webpage_url': 'https://youtube.com/watch?v=' + vid_local,
                 'uploader': streams.get('uploader', 'Unknown'),
             }
         except Exception as e:
             last_err = e
-            print(f'[WARN] piped {inst}: {e}')
-    raise RuntimeError(f'piped failed all instances: {last_err}')
+            print('[WARN] piped ' + inst + ': ' + str(e))
+    raise RuntimeError('piped failed: ' + str(last_err))
 
 
 def fetch_via_invidious(query):
@@ -149,32 +146,32 @@ def fetch_via_invidious(query):
     for inst in INVIDIOUS_INSTANCES:
         try:
             if not vid:
-                s = http_get_json(f'{inst}/api/v1/search?q={urllib.parse.quote(query)}&type=video')
+                s = http_get_json(inst + '/api/v1/search?q=' + urllib.parse.quote(query) + '&type=video')
                 if not s:
                     raise RuntimeError('no results')
                 vid_local = s[0]['videoId']
             else:
                 vid_local = vid
-            v = http_get_json(f'{inst}/api/v1/videos/{vid_local}')
+            v = http_get_json(inst + '/api/v1/videos/' + vid_local)
             fmts = v.get('adaptiveFormats') or []
             audio_fmts = [f for f in fmts if 'audio' in (f.get('type') or '')]
             if not audio_fmts:
                 raise RuntimeError('no audio formats')
             audio_fmts.sort(key=lambda a: a.get('bitrate', 0), reverse=True)
             best = audio_fmts[0]
-            print(f'[OK] invidious via {inst}')
+            print('[OK] invidious via ' + inst)
             return {
                 'url': best['url'],
                 'title': v.get('title', 'Unknown'),
                 'duration': v.get('lengthSeconds', 0),
                 'thumbnail': (v.get('videoThumbnails') or [{}])[0].get('url'),
-                'webpage_url': f'https://youtube.com/watch?v={vid_local}',
+                'webpage_url': 'https://youtube.com/watch?v=' + vid_local,
                 'uploader': v.get('author', 'Unknown'),
             }
         except Exception as e:
             last_err = e
-            print(f'[WARN] invidious {inst}: {e}')
-    raise RuntimeError(f'invidious failed all instances: {last_err}')
+            print('[WARN] invidious ' + inst + ': ' + str(e))
+    raise RuntimeError('invidious failed: ' + str(last_err))
 
 
 async def fetch_track(query):
@@ -186,8 +183,8 @@ async def fetch_track(query):
             try:
                 return fn(query)
             except Exception as e:
-                errors.append(f'{name}: {e}')
-                print(f'[FAIL] {name}: {e}')
+                errors.append(name + ': ' + str(e))
+                print('[FAIL] ' + name + ': ' + str(e))
         raise RuntimeError(' | '.join(errors))
 
     return await loop.run_in_executor(None, _run)
@@ -214,14 +211,14 @@ def fmt_duration(seconds):
     h, rem = divmod(s, 3600)
     m, sec = divmod(rem, 60)
     if h:
-        return f'{h}:{m:02d}:{sec:02d}'
-    return f'{m}:{sec:02d}'
+        return str(h) + ':' + str(m).zfill(2) + ':' + str(sec).zfill(2)
+    return str(m) + ':' + str(sec).zfill(2)
 
 
 def make_np_embed(track):
     embed = discord.Embed(
         title='🎵 กำลังเล่นเพลง',
-        description=f'**[{track["title"]}]({track["webpage_url"]})**',
+        description='**[' + track['title'] + '](' + track['webpage_url'] + ')**',
         color=0x5865F2,
     )
     embed.add_field(name='⏱ ความยาว', value=fmt_duration(track['duration']), inline=True)
@@ -245,14 +242,13 @@ async def play_next(ctx):
         ctx.voice_client.play(source, after=lambda _: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop))
         await ctx.send(embed=make_np_embed(track))
     except Exception as e:
-        await ctx.send(f'⚠️ เล่นไม่ได้: `{e}`
-ข้ามเพลงถัดไป...')
+        await ctx.send('⚠️ เล่นไม่ได้: ' + str(e) + '\nข้ามเพลงถัดไป...')
         asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
 
 
 @bot.event
 async def on_ready():
-    print(f'[OK] {bot.user} online (ID: {bot.user.id})')
+    print('[OK] ' + str(bot.user) + ' online')
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name='!play'))
 
 
@@ -261,9 +257,9 @@ async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
         return
     if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send('⚠️ ใส่ชื่อเพลงหรือ link ด้วย เช่น `!play จี๋หอย`')
+        await ctx.send('⚠️ ใส่ชื่อเพลงหรือ link ด้วย เช่น !play จี๋หอย')
         return
-    await ctx.send(f'⚠️ Error: `{error}`')
+    await ctx.send('⚠️ Error: ' + str(error))
 
 
 @bot.command(name='play', aliases=['p'])
@@ -276,18 +272,20 @@ async def play(ctx, *, query):
         vc = await ctx.author.voice.channel.connect()
     elif vc.channel != ctx.author.voice.channel:
         await vc.move_to(ctx.author.voice.channel)
-    status = await ctx.send(f'🔍 กำลังค้นหา: `{query}`...')
+    status = await ctx.send('🔍 กำลังค้นหา: ' + query + ' ...')
     try:
         track = await fetch_track(query)
     except Exception as e:
-        await status.edit(content=f'❌ ไม่พบเพลงนั้น
-`{str(e)[:500]}`')
+        await status.edit(content='❌ ไม่พบเพลงนั้น\n' + str(e)[:500])
         return
     queue = get_queue(ctx.guild.id)
     if vc.is_playing() or vc.is_paused():
         queue.append(track)
-        embed = discord.Embed(title='✅ เพิ่มเข้าคิวแล้ว',
-            description=f'**[{track["title"]}]({track["webpage_url"]})**', color=0x57F287)
+        embed = discord.Embed(
+            title='✅ เพิ่มเข้าคิวแล้ว',
+            description='**[' + track['title'] + '](' + track['webpage_url'] + ')**',
+            color=0x57F287,
+        )
         embed.add_field(name='ลำดับในคิว', value=str(len(queue)), inline=True)
         embed.add_field(name='⏱ ความยาว', value=fmt_duration(track['duration']), inline=True)
         if track.get('thumbnail'):
@@ -316,15 +314,15 @@ async def show_queue(ctx):
     embed = discord.Embed(title='📋 คิวเพลง', color=0x5865F2)
     if np:
         embed.add_field(name='🎵 กำลังเล่น',
-            value=f'**{np["title"]}**  `{fmt_duration(np["duration"])}`', inline=False)
+            value='**' + np['title'] + '**  ' + fmt_duration(np['duration']),
+            inline=False)
     if queue:
         lines = []
         for i, t in enumerate(queue[:10], 1):
-            lines.append(f'`{i}.` **{t["title"]}**  `{fmt_duration(t["duration"])}`')
+            lines.append(str(i) + '. **' + t['title'] + '**  ' + fmt_duration(t['duration']))
         if len(queue) > 10:
-            lines.append(f'_...และอีก {len(queue) - 10} เพลง_')
-        embed.add_field(name=f'รอในคิว ({len(queue)} เพลง)', value='
-'.join(lines), inline=False)
+            lines.append('...และอีก ' + str(len(queue) - 10) + ' เพลง')
+        embed.add_field(name='รอในคิว (' + str(len(queue)) + ' เพลง)', value='\n'.join(lines), inline=False)
     elif not np:
         embed.description = 'คิวว่างเปล่า'
     await ctx.send(embed=embed)
