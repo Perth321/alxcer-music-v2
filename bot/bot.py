@@ -16,19 +16,18 @@ YDL_OPTIONS = {
     'no_warnings': True,
     'noplaylist': False,
     'source_address': '0.0.0.0',
-    'cookiefile': None,
 }
 
 intents = discord.Intents.default()
 intents.message_content = True
-intents.voice_states = True
+intents.members = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 queues = {}
 
 def is_url(text):
-    return re.match(r'https?://', text) is not None
+    return re.match(r'https?://', text.strip()) is not None
 
 def get_queue(guild_id):
     if guild_id not in queues:
@@ -36,16 +35,11 @@ def get_queue(guild_id):
     return queues[guild_id]
 
 async def extract_info(query):
-    ydl_opts = dict(YDL_OPTIONS)
     loop = asyncio.get_event_loop()
-
-    if is_url(query):
-        search_query = query
-    else:
-        search_query = f'ytsearch:{query}'
+    search_query = query.strip() if is_url(query) else f'ytsearch:{query}'
 
     def _extract():
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
             info = ydl.extract_info(search_query, download=False)
             if 'entries' in info:
                 info = info['entries'][0]
@@ -62,25 +56,33 @@ async def play_next(ctx):
             source,
             after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
         )
-        mins, secs = divmod(duration, 60)
-        dur_str = f'{mins}:{secs:02d}' if duration else 'Unknown'
-        embed = discord.Embed(title='Now Playing', description=f'**{title}**', color=discord.Color.blurple())
+        mins, secs = divmod(int(duration), 60)
+        dur_str = f'{mins}:{secs:02d}' if duration else '?'
+        embed = discord.Embed(title='Now Playing', description=f'**{title}**', color=0x5865F2)
         embed.add_field(name='Duration', value=dur_str)
         await ctx.send(embed=embed)
     else:
-        await ctx.send('Queue is empty.')
+        if ctx.voice_client:
+            await ctx.send('Queue finished. Disconnecting...')
+            await ctx.voice_client.disconnect()
 
 @bot.event
 async def on_ready():
-    print(f'Bot is ready: {bot.user}')
+    print(f'[OK] Bot online: {bot.user} (ID: {bot.user.id})')
     await bot.change_presence(
         activity=discord.Activity(type=discord.ActivityType.listening, name='!play')
     )
 
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        return
+    await ctx.send(f'Error: {error}')
+
 @bot.command(name='play', aliases=['p'])
 async def play(ctx, *, query):
     if not ctx.author.voice:
-        await ctx.send('You need to be in a voice channel first!')
+        await ctx.send('You need to join a voice channel first!')
         return
 
     voice_channel = ctx.author.voice.channel
@@ -90,22 +92,22 @@ async def play(ctx, *, query):
     elif ctx.voice_client.channel != voice_channel:
         await ctx.voice_client.move_to(voice_channel)
 
-    msg = await ctx.send(f'Searching: **{query}**...')
+    msg = await ctx.send(f'Searching: `{query}`...')
 
     try:
         url, title, duration = await extract_info(query)
     except Exception as e:
-        await msg.edit(content=f'Error: Could not find or play that. `{e}`')
+        await msg.edit(content=f'Could not find or play that.\nError: `{e}`')
         return
 
     queue = get_queue(ctx.guild.id)
-    mins, secs = divmod(duration, 60)
-    dur_str = f'{mins}:{secs:02d}' if duration else 'Unknown'
+    mins, secs = divmod(int(duration), 60)
+    dur_str = f'{mins}:{secs:02d}' if duration else '?'
 
     if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
         queue.append((url, title, duration))
-        embed = discord.Embed(title='Added to Queue', description=f'**{title}**', color=discord.Color.green())
-        embed.add_field(name='Position', value=str(len(queue)))
+        embed = discord.Embed(title='Added to Queue', description=f'**{title}**', color=0x57F287)
+        embed.add_field(name='Position in queue', value=str(len(queue)))
         embed.add_field(name='Duration', value=dur_str)
         await msg.edit(content=None, embed=embed)
     else:
@@ -114,7 +116,7 @@ async def play(ctx, *, query):
             source,
             after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
         )
-        embed = discord.Embed(title='Now Playing', description=f'**{title}**', color=discord.Color.blurple())
+        embed = discord.Embed(title='Now Playing', description=f'**{title}**', color=0x5865F2)
         embed.add_field(name='Duration', value=dur_str)
         await msg.edit(content=None, embed=embed)
 
@@ -132,13 +134,13 @@ async def show_queue(ctx):
     if not queue:
         await ctx.send('Queue is empty.')
         return
-    embed = discord.Embed(title='Queue', color=discord.Color.blurple())
-    for i, (url, title, duration) in enumerate(queue[:10], 1):
-        mins, secs = divmod(duration, 60)
+    embed = discord.Embed(title=f'Queue ({len(queue)} songs)', color=0x5865F2)
+    for i, (_, title, duration) in enumerate(queue[:10], 1):
+        mins, secs = divmod(int(duration), 60)
         dur_str = f'{mins}:{secs:02d}' if duration else '?'
-        embed.add_field(name=f'{i}. {title}', value=f'Duration: {dur_str}', inline=False)
+        embed.add_field(name=f'{i}. {title}', value=f'`{dur_str}`', inline=False)
     if len(queue) > 10:
-        embed.set_footer(text=f'...and {len(queue) - 10} more')
+        embed.set_footer(text=f'...and {len(queue) - 10} more songs')
     await ctx.send(embed=embed)
 
 @bot.command(name='stop')
@@ -147,7 +149,7 @@ async def stop(ctx):
         queues[ctx.guild.id] = []
         ctx.voice_client.stop()
         await ctx.voice_client.disconnect()
-        await ctx.send('Stopped and disconnected.')
+        await ctx.send('Stopped and left the voice channel.')
     else:
         await ctx.send('Not connected to a voice channel.')
 
@@ -167,29 +169,29 @@ async def resume(ctx):
     else:
         await ctx.send('Nothing is paused.')
 
-@bot.command(name='nowplaying', aliases=['np'])
-async def nowplaying(ctx):
-    if ctx.voice_client and ctx.voice_client.is_playing():
-        await ctx.send('A song is currently playing. Use `!queue` to see the queue.')
-    else:
-        await ctx.send('Nothing is playing right now.')
-
 @bot.command(name='clear', aliases=['cl'])
 async def clear_queue(ctx):
     queues[ctx.guild.id] = []
     await ctx.send('Queue cleared!')
 
-@bot.command(name='help_music', aliases=['commands', 'h'])
-async def help_music(ctx):
-    embed = discord.Embed(title='Music Bot Commands', color=discord.Color.blurple())
-    embed.add_field(name='!play <song or YouTube URL>', value='Play a song by name or paste a YouTube link', inline=False)
-    embed.add_field(name='!skip  (!s)', value='Skip current song', inline=False)
-    embed.add_field(name='!queue  (!q)', value='Show current queue', inline=False)
-    embed.add_field(name='!pause', value='Pause the song', inline=False)
-    embed.add_field(name='!resume', value='Resume the song', inline=False)
-    embed.add_field(name='!stop', value='Stop and disconnect', inline=False)
-    embed.add_field(name='!clear', value='Clear the queue', inline=False)
-    embed.add_field(name='!nowplaying  (!np)', value='Show current song info', inline=False)
+@bot.command(name='np', aliases=['nowplaying'])
+async def nowplaying(ctx):
+    if ctx.voice_client and ctx.voice_client.is_playing():
+        await ctx.send('A song is currently playing.')
+    else:
+        await ctx.send('Nothing is playing right now.')
+
+@bot.command(name='commands', aliases=['h', 'help_music'])
+async def show_commands(ctx):
+    embed = discord.Embed(title='Music Bot Commands', color=0x5865F2)
+    embed.add_field(name='!play <ชื่อเพลง หรือ YouTube URL>', value='เล่นเพลงหรือวาง YouTube link', inline=False)
+    embed.add_field(name='!skip  (หรือ !s)', value='ข้ามเพลง', inline=False)
+    embed.add_field(name='!queue  (หรือ !q)', value='ดูคิวเพลง', inline=False)
+    embed.add_field(name='!pause', value='หยุดชั่วคราว', inline=False)
+    embed.add_field(name='!resume', value='เล่นต่อ', inline=False)
+    embed.add_field(name='!clear', value='ล้างคิวเพลง', inline=False)
+    embed.add_field(name='!stop', value='หยุดและออกจาก voice channel', inline=False)
+    embed.add_field(name='!np', value='แสดงเพลงที่กำลังเล่น', inline=False)
     await ctx.send(embed=embed)
 
 TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
