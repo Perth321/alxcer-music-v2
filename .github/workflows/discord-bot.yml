@@ -36,6 +36,12 @@ jobs:
         run: |
           pip install -r bot/requirements.txt
 
+      - name: Write YouTube cookies
+        if: ${{ secrets.YOUTUBE_COOKIES != '' }}
+        run: |
+          echo "${{ secrets.YOUTUBE_COOKIES }}" > bot/cookies.txt
+          echo "cookies.txt written"
+
       - name: Run Discord Music Bot
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
