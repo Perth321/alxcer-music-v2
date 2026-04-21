@@ -11,7 +11,7 @@ permissions:
 
 concurrency:
   group: discord-bot
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   run-bot:
@@ -42,13 +42,12 @@ jobs:
         run: |
           python bot/bot.py
 
-      - name: Auto-restart bot after session ends
-        if: ${{ !cancelled() }}
+      - name: Auto-restart after crash
+        if: ${{ failure() }}
         run: |
-          echo "Bot session ended, restarting..."
+          echo "Bot crashed, triggering restart..."
           curl -s -X POST \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github.v3+json" \
             https://api.github.com/repos/${{ github.repository }}/actions/workflows/discord-bot.yml/dispatches \
             -d '{"ref":"main"}'
-          echo "Restart triggered"
