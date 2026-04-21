@@ -12,25 +12,39 @@ FFMPEG_OPTIONS = {
 
 COOKIES_FILE = os.path.join(os.path.dirname(__file__), 'cookies.txt')
 
-def make_ydl_opts():
+# Multiple extractor client fallbacks — first that works wins
+YT_CLIENT_FALLBACKS = [
+    ['ios'],
+    ['android_vr'],
+    ['mweb'],
+    ['tv_embedded'],
+    ['web_safari'],
+    ['android'],
+]
+
+
+def make_ydl_opts(client):
     opts = {
-        'format': 'bestaudio/best',
+        'format': 'bestaudio[ext=m4a]/bestaudio/best',
         'quiet': True,
         'no_warnings': True,
         'noplaylist': True,
         'source_address': '0.0.0.0',
+        'geo_bypass': True,
+        'nocheckcertificate': True,
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'tv_embedded'],
+                'player_client': client,
             }
+        },
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
         },
     }
     if os.path.exists(COOKIES_FILE):
         opts['cookiefile'] = COOKIES_FILE
-        print('[INFO] Using YouTube cookies file')
-    else:
-        print('[WARN] No cookies.txt found — YouTube may block playback on this IP')
     return opts
+
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -67,18 +81,31 @@ async def fetch_track(query: str) -> dict:
     search = query.strip() if is_url(query) else f'ytsearch1:{query}'
 
     def _run():
-        with yt_dlp.YoutubeDL(make_ydl_opts()) as ydl:
-            data = ydl.extract_info(search, download=False)
-            if 'entries' in data:
-                data = data['entries'][0]
-            return {
-                'url': data['url'],
-                'title': data.get('title', 'Unknown'),
-                'duration': data.get('duration', 0),
-                'thumbnail': data.get('thumbnail'),
-                'webpage_url': data.get('webpage_url', ''),
-                'uploader': data.get('uploader', 'Unknown'),
-            }
+        last_err = None
+        for client in YT_CLIENT_FALLBACKS:
+            try:
+                with yt_dlp.YoutubeDL(make_ydl_opts(client)) as ydl:
+                    data = ydl.extract_info(search, download=False)
+                    if 'entries' in data:
+                        if not data['entries']:
+                            raise RuntimeError('No results')
+                        data = data['entries'][0]
+                    if not data.get('url'):
+                        raise RuntimeError('No stream URL')
+                    print(f'[OK] extracted via client={client}')
+                    return {
+                        'url': data['url'],
+                        'title': data.get('title', 'Unknown'),
+                        'duration': data.get('duration', 0),
+                        'thumbnail': data.get('thumbnail'),
+                        'webpage_url': data.get('webpage_url', ''),
+                        'uploader': data.get('uploader', 'Unknown'),
+                    }
+            except Exception as e:
+                last_err = e
+                print(f'[WARN] client={client} failed: {e}')
+                continue
+        raise RuntimeError(f'All YouTube clients failed. Last error: {last_err}')
 
     return await loop.run_in_executor(None, _run)
 
