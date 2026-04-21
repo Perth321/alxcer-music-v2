@@ -7,11 +7,33 @@ import re
 import urllib.request
 import urllib.parse
 import json
+import logging
+import sys
 
-FFMPEG_OPTIONS = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    'options': '-vn'
-}
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
+    stream=sys.stdout,
+)
+log = logging.getLogger('alxcer')
+
+# Try to load opus explicitly (required for voice)
+if not discord.opus.is_loaded():
+    for name in ('libopus.so.0', 'libopus.so', 'opus'):
+        try:
+            discord.opus.load_opus(name)
+            log.info('opus loaded: %s', name)
+            break
+        except Exception as e:
+            log.warning('opus load %s failed: %s', name, e)
+
+FFMPEG_BEFORE = (
+    '-nostdin '
+    '-reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 '
+    '-reconnect_on_http_error 4xx,5xx -reconnect_delay_max 30 '
+    '-rw_timeout 15000000'
+)
+FFMPEG_OPTIONS = '-vn -b:a 128k'
 
 COOKIES_FILE = os.path.join(os.path.dirname(__file__), 'cookies.txt')
 
@@ -50,8 +72,8 @@ def http_get_json(url, timeout=8):
         return json.loads(r.read().decode('utf-8', 'ignore'))
 
 
-def extract_video_id(url_or_query):
-    m = re.search(r'(?:v=|youtu\.be/|/shorts/|/embed/)([A-Za-z0-9_-]{11})', url_or_query)
+def extract_video_id(s):
+    m = re.search(r'(?:v=|youtu\.be/|/shorts/|/embed/)([A-Za-z0-9_-]{11})', s)
     return m.group(1) if m else None
 
 
@@ -87,7 +109,7 @@ def fetch_via_ytdlp(query):
                     data = data['entries'][0]
                 if not data.get('url'):
                     raise RuntimeError('no stream url')
-                print('[OK] ytdlp client=' + str(client))
+                log.info('ytdlp ok client=%s', client)
                 return {
                     'url': data['url'],
                     'title': data.get('title', 'Unknown'),
@@ -98,8 +120,8 @@ def fetch_via_ytdlp(query):
                 }
         except Exception as e:
             last_err = e
-            print('[WARN] ytdlp client=' + str(client) + ': ' + str(e))
-    raise RuntimeError('ytdlp failed all clients: ' + str(last_err))
+            log.warning('ytdlp client=%s fail: %s', client, e)
+    raise RuntimeError('ytdlp failed: ' + str(last_err))
 
 
 def fetch_via_piped(query):
@@ -125,7 +147,7 @@ def fetch_via_piped(query):
                 raise RuntimeError('no audio streams')
             audio.sort(key=lambda a: a.get('bitrate', 0), reverse=True)
             best = audio[0]
-            print('[OK] piped via ' + inst)
+            log.info('piped ok via %s', inst)
             return {
                 'url': best['url'],
                 'title': streams.get('title', 'Unknown'),
@@ -136,7 +158,7 @@ def fetch_via_piped(query):
             }
         except Exception as e:
             last_err = e
-            print('[WARN] piped ' + inst + ': ' + str(e))
+            log.warning('piped %s: %s', inst, e)
     raise RuntimeError('piped failed: ' + str(last_err))
 
 
@@ -159,7 +181,7 @@ def fetch_via_invidious(query):
                 raise RuntimeError('no audio formats')
             audio_fmts.sort(key=lambda a: a.get('bitrate', 0), reverse=True)
             best = audio_fmts[0]
-            print('[OK] invidious via ' + inst)
+            log.info('invidious ok via %s', inst)
             return {
                 'url': best['url'],
                 'title': v.get('title', 'Unknown'),
@@ -170,7 +192,7 @@ def fetch_via_invidious(query):
             }
         except Exception as e:
             last_err = e
-            print('[WARN] invidious ' + inst + ': ' + str(e))
+            log.warning('invidious %s: %s', inst, e)
     raise RuntimeError('invidious failed: ' + str(last_err))
 
 
@@ -179,12 +201,13 @@ async def fetch_track(query):
 
     def _run():
         errors = []
-        for fn, name in [(fetch_via_piped, 'piped'), (fetch_via_invidious, 'invidious'), (fetch_via_ytdlp, 'ytdlp')]:
+        for fn, name in [(fetch_via_piped, 'piped'),
+                         (fetch_via_invidious, 'invidious'),
+                         (fetch_via_ytdlp, 'ytdlp')]:
             try:
                 return fn(query)
             except Exception as e:
                 errors.append(name + ': ' + str(e))
-                print('[FAIL] ' + name + ': ' + str(e))
         raise RuntimeError(' | '.join(errors))
 
     return await loop.run_in_executor(None, _run)
@@ -192,6 +215,7 @@ async def fetch_track(query):
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.voice_states = True
 bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 
 queues = {}
@@ -228,28 +252,78 @@ def make_np_embed(track):
     return embed
 
 
+async def ensure_voice(ctx):
+    """Connect/move to caller's voice channel with retries."""
+    target = ctx.author.voice.channel
+    vc = ctx.voice_client
+
+    for attempt in range(1, 5):
+        try:
+            if vc and vc.is_connected():
+                if vc.channel != target:
+                    await vc.move_to(target)
+                return vc
+            vc = await target.connect(timeout=30.0, reconnect=True, self_deaf=True)
+            log.info('voice connected (attempt %d)', attempt)
+            return vc
+        except (asyncio.TimeoutError, discord.errors.ConnectionClosed, discord.ClientException) as e:
+            log.warning('voice connect attempt %d failed: %s', attempt, e)
+            try:
+                if ctx.voice_client:
+                    await ctx.voice_client.disconnect(force=True)
+            except Exception:
+                pass
+            vc = None
+            await asyncio.sleep(2 * attempt)
+    raise RuntimeError('voice connect failed after 4 attempts')
+
+
 async def play_next(ctx):
     queue = get_queue(ctx.guild.id)
     if not queue:
         now_playing.pop(ctx.guild.id, None)
-        if ctx.voice_client and ctx.voice_client.is_connected():
-            await ctx.send('✅ เล่นครบทุกเพลงแล้ว')
         return
+
     track = queue.pop(0)
     now_playing[ctx.guild.id] = track
+
     try:
-        source = discord.FFmpegPCMAudio(track['url'], **FFMPEG_OPTIONS)
-        ctx.voice_client.play(source, after=lambda _: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop))
+        if not ctx.voice_client or not ctx.voice_client.is_connected():
+            log.warning('no voice client when playing next; skipping')
+            return
+        source = discord.FFmpegPCMAudio(
+            track['url'],
+            before_options=FFMPEG_BEFORE,
+            options=FFMPEG_OPTIONS,
+        )
+        ctx.voice_client.play(
+            source,
+            after=lambda err: (log.warning('after-play err: %s', err) if err else None,
+                                asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)),
+        )
         await ctx.send(embed=make_np_embed(track))
     except Exception as e:
-        await ctx.send('⚠️ เล่นไม่ได้: ' + str(e) + '\nข้ามเพลงถัดไป...')
+        log.exception('play_next error')
+        try:
+            await ctx.send('⚠️ เล่นไม่ได้: ' + str(e) + '\nข้ามเพลงถัดไป...')
+        except Exception:
+            pass
         asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
 
 
 @bot.event
 async def on_ready():
-    print('[OK] ' + str(bot.user) + ' online')
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name='!play'))
+    log.info('%s online (id=%s)', bot.user, bot.user.id)
+    await bot.change_presence(
+        activity=discord.Activity(type=discord.ActivityType.listening, name='!play')
+    )
+
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    if member.id != bot.user.id:
+        return
+    log.info('voice state: before.channel=%s after.channel=%s', before.channel, after.channel)
 
 
 @bot.event
@@ -259,7 +333,11 @@ async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingRequiredArgument):
         await ctx.send('⚠️ ใส่ชื่อเพลงหรือ link ด้วย เช่น !play จี๋หอย')
         return
-    await ctx.send('⚠️ Error: ' + str(error))
+    log.exception('command error: %s', error)
+    try:
+        await ctx.send('⚠️ Error: ' + str(error))
+    except Exception:
+        pass
 
 
 @bot.command(name='play', aliases=['p'])
@@ -267,18 +345,23 @@ async def play(ctx, *, query):
     if not ctx.author.voice:
         await ctx.send('❌ เข้า voice channel ก่อนนะ!')
         return
-    vc = ctx.voice_client
-    if vc is None:
-        vc = await ctx.author.voice.channel.connect()
-    elif vc.channel != ctx.author.voice.channel:
-        await vc.move_to(ctx.author.voice.channel)
-    status = await ctx.send('🔍 กำลังค้นหา: ' + query + ' ...')
+
+    status = await ctx.send('🔍 กำลังเชื่อมต่อและค้นหา: ' + query + ' ...')
+
+    try:
+        vc = await ensure_voice(ctx)
+    except Exception as e:
+        await status.edit(content='❌ เชื่อมต่อ voice ไม่ได้: ' + str(e))
+        return
+
     try:
         track = await fetch_track(query)
     except Exception as e:
         await status.edit(content='❌ ไม่พบเพลงนั้น\n' + str(e)[:500])
         return
+
     queue = get_queue(ctx.guild.id)
+
     if vc.is_playing() or vc.is_paused():
         queue.append(track)
         embed = discord.Embed(
@@ -293,9 +376,21 @@ async def play(ctx, *, query):
         await status.edit(content=None, embed=embed)
     else:
         now_playing[ctx.guild.id] = track
-        source = discord.FFmpegPCMAudio(track['url'], **FFMPEG_OPTIONS)
-        vc.play(source, after=lambda _: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop))
-        await status.edit(content=None, embed=make_np_embed(track))
+        try:
+            source = discord.FFmpegPCMAudio(
+                track['url'],
+                before_options=FFMPEG_BEFORE,
+                options=FFMPEG_OPTIONS,
+            )
+            vc.play(
+                source,
+                after=lambda err: (log.warning('after-play err: %s', err) if err else None,
+                                    asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)),
+            )
+            await status.edit(content=None, embed=make_np_embed(track))
+        except Exception as e:
+            log.exception('play start error')
+            await status.edit(content='❌ เริ่มเล่นไม่ได้: ' + str(e))
 
 
 @bot.command(name='skip', aliases=['s'])
@@ -322,7 +417,8 @@ async def show_queue(ctx):
             lines.append(str(i) + '. **' + t['title'] + '**  ' + fmt_duration(t['duration']))
         if len(queue) > 10:
             lines.append('...และอีก ' + str(len(queue) - 10) + ' เพลง')
-        embed.add_field(name='รอในคิว (' + str(len(queue)) + ' เพลง)', value='\n'.join(lines), inline=False)
+        embed.add_field(name='รอในคิว (' + str(len(queue)) + ' เพลง)',
+                        value='\n'.join(lines), inline=False)
     elif not np:
         embed.description = 'คิวว่างเปล่า'
     await ctx.send(embed=embed)
@@ -366,7 +462,7 @@ async def leave(ctx):
     if ctx.voice_client:
         queues[ctx.guild.id] = []
         now_playing.pop(ctx.guild.id, None)
-        await ctx.voice_client.disconnect()
+        await ctx.voice_client.disconnect(force=True)
         await ctx.send('👋 ออกจาก voice channel แล้ว')
     else:
         await ctx.send('❌ บอทไม่ได้อยู่ใน voice channel')
@@ -378,10 +474,28 @@ async def stop(ctx):
         queues[ctx.guild.id] = []
         now_playing.pop(ctx.guild.id, None)
         ctx.voice_client.stop()
-        await ctx.voice_client.disconnect()
+        await ctx.voice_client.disconnect(force=True)
         await ctx.send('⏹️ หยุดและออกจาก voice channel แล้ว')
     else:
         await ctx.send('❌ บอทไม่ได้อยู่ใน voice channel')
+
+
+@bot.command(name='reconnect', aliases=['rc'])
+async def reconnect(ctx):
+    """Force reconnect voice."""
+    if ctx.voice_client:
+        try:
+            await ctx.voice_client.disconnect(force=True)
+        except Exception:
+            pass
+    if not ctx.author.voice:
+        await ctx.send('❌ เข้า voice channel ก่อน แล้วใช้ !rc')
+        return
+    try:
+        await ensure_voice(ctx)
+        await ctx.send('🔄 เชื่อมต่อ voice ใหม่แล้ว')
+    except Exception as e:
+        await ctx.send('❌ เชื่อมต่อไม่ได้: ' + str(e))
 
 
 @bot.command(name='help', aliases=['h', 'commands'])
@@ -392,6 +506,7 @@ async def help_cmd(ctx):
     embed.add_field(name='!queue  (!q)', value='ดูคิวเพลง', inline=False)
     embed.add_field(name='!np', value='ดูเพลงที่เล่นอยู่', inline=False)
     embed.add_field(name='!pause / !resume', value='หยุดชั่วคราว / เล่นต่อ', inline=False)
+    embed.add_field(name='!reconnect (!rc)', value='เชื่อมต่อ voice ใหม่ถ้าหลุด', inline=False)
     embed.add_field(name='!clear', value='ล้างคิว', inline=False)
     embed.add_field(name='!leave  (!dc)', value='ออกจาก voice channel', inline=False)
     embed.add_field(name='!stop', value='หยุดเพลง + ออก voice channel', inline=False)
@@ -401,4 +516,4 @@ async def help_cmd(ctx):
 TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
 if not TOKEN:
     raise RuntimeError('DISCORD_BOT_TOKEN is not set!')
-bot.run(TOKEN)
+bot.run(TOKEN, log_handler=None)
