@@ -77,6 +77,87 @@ def extract_video_id(s):
     return m.group(1) if m else None
 
 
+_SC_CLIENT_ID = None
+_SC_CLIENT_ID_TS = 0
+
+
+def get_soundcloud_client_id():
+    """Scrape a fresh SoundCloud client_id from their homepage (cached 1h)."""
+    import time
+    global _SC_CLIENT_ID, _SC_CLIENT_ID_TS
+    if _SC_CLIENT_ID and time.time() - _SC_CLIENT_ID_TS < 3600:
+        return _SC_CLIENT_ID
+    req = urllib.request.Request('https://soundcloud.com/', headers={
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
+    })
+    with urllib.request.urlopen(req, timeout=10) as r:
+        home = r.read().decode('utf-8', 'ignore')
+    scripts = re.findall(r'https://[^"]+sndcdn\.com[^"]+\.js', home)
+    for s in reversed(scripts[-6:]):
+        try:
+            sreq = urllib.request.Request(s, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(sreq, timeout=10) as r:
+                js = r.read().decode('utf-8', 'ignore')
+            m = re.search(r'client_id\s*[:=]\s*["\']([a-zA-Z0-9]{20,})["\']', js)
+            if m:
+                _SC_CLIENT_ID = m.group(1)
+                _SC_CLIENT_ID_TS = time.time()
+                log.info('soundcloud client_id refreshed')
+                return _SC_CLIENT_ID
+        except Exception:
+            continue
+    raise RuntimeError('could not get soundcloud client_id')
+
+
+def fetch_via_soundcloud(query):
+    """Search SoundCloud (no auth needed) and return playable stream."""
+    q = query.strip()
+    if 'soundcloud.com' in q and re.match(r'https?://', q):
+        track_url = q
+        title = q.split('/')[-1].replace('-', ' ').title()
+        duration = 0
+        thumb = None
+        uploader = 'SoundCloud'
+    else:
+        cid = get_soundcloud_client_id()
+        url = ('https://api-v2.soundcloud.com/search/tracks?q=' +
+               urllib.parse.quote(q) + '&limit=5&client_id=' + cid)
+        data = http_get_json(url, timeout=10)
+        items = [t for t in (data.get('collection') or []) if t.get('streamable')]
+        if not items:
+            raise RuntimeError('no results')
+        t = items[0]
+        track_url = t['permalink_url']
+        title = t.get('title', 'Unknown')
+        duration = int((t.get('duration') or 0) / 1000)
+        thumb = t.get('artwork_url')
+        uploader = (t.get('user') or {}).get('username', 'SoundCloud')
+
+    # Use yt-dlp to extract the actual stream URL (handles SoundCloud cleanly, no auth)
+    opts = {
+        'format': 'bestaudio/best',
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': True,
+        'source_address': '0.0.0.0',
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(track_url, download=False)
+    if 'entries' in info:
+        info = info['entries'][0]
+    if not info.get('url'):
+        raise RuntimeError('no stream url from yt-dlp')
+    log.info('soundcloud ok: %s', title)
+    return {
+        'url': info['url'],
+        'title': info.get('title', title),
+        'duration': info.get('duration', duration) or duration,
+        'thumbnail': info.get('thumbnail') or thumb,
+        'webpage_url': track_url,
+        'uploader': info.get('uploader', uploader) or uploader,
+    }
+
+
 def youtube_html_search(query, n=5):
     """Scrape youtube.com/results for video IDs. Works from any IP."""
     url = 'https://www.youtube.com/results?search_query=' + urllib.parse.quote(query)
@@ -229,7 +310,8 @@ async def fetch_track(query):
 
     def _run():
         errors = []
-        for fn, name in [(fetch_via_ytdlp, 'ytdlp'),
+        for fn, name in [(fetch_via_soundcloud, 'soundcloud'),
+                         (fetch_via_ytdlp, 'ytdlp'),
                          (fetch_via_piped, 'piped'),
                          (fetch_via_invidious, 'invidious')]:
             try:
