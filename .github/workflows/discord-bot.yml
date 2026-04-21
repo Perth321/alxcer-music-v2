@@ -2,11 +2,12 @@ name: Discord Music Bot 24/7
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ main ]
-    paths:
-      - 'bot/**'
-      - '.github/workflows/discord-bot.yml'
+  schedule:
+    - cron: '0 */5 * * *'
+
+permissions:
+  actions: write
+  contents: read
 
 jobs:
   run-bot:
@@ -24,7 +25,7 @@ jobs:
 
       - name: Install FFmpeg
         run: |
-          sudo apt-get update
+          sudo apt-get update -qq
           sudo apt-get install -y ffmpeg
 
       - name: Install dependencies
@@ -36,3 +37,13 @@ jobs:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
         run: |
           python bot/bot.py
+
+      - name: Restart bot (keep online 24/7)
+        if: always()
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/discord-bot.yml/dispatches \
+            -d '{"ref":"main"}'
+          echo "Bot restarted successfully"
