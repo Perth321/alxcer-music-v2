@@ -37,10 +37,15 @@ jobs:
           pip install -r bot/requirements.txt
 
       - name: Write YouTube cookies
-        if: ${{ secrets.YOUTUBE_COOKIES != '' }}
+        env:
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
         run: |
-          echo "${{ secrets.YOUTUBE_COOKIES }}" > bot/cookies.txt
-          echo "cookies.txt written"
+          if [ -n "$YOUTUBE_COOKIES" ]; then
+            printf '%s' "$YOUTUBE_COOKIES" > bot/cookies.txt
+            echo "cookies.txt written ($(wc -c < bot/cookies.txt) bytes)"
+          else
+            echo "No YOUTUBE_COOKIES secret — YouTube may block this IP"
+          fi
 
       - name: Run Discord Music Bot
         env:
