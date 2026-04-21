@@ -27,10 +27,10 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install FFmpeg
+      - name: Install FFmpeg + libopus
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg libopus0 libopus-dev libsodium23
 
       - name: Install dependencies
         run: |
@@ -45,14 +45,15 @@ jobs:
             printf '%s' "$YOUTUBE_COOKIES" > bot/cookies.txt
             echo "cookies.txt written ($(wc -c < bot/cookies.txt) bytes)"
           else
-            echo "No YOUTUBE_COOKIES — using anonymous extractor clients"
+            echo "No YOUTUBE_COOKIES — using public proxies"
           fi
 
       - name: Run Discord Music Bot
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          PYTHONUNBUFFERED: '1'
         run: |
-          python bot/bot.py
+          python -u bot/bot.py
 
       - name: Auto-restart after exit
         if: ${{ always() }}
