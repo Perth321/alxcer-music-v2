@@ -3,6 +3,7 @@ from discord.ext import commands
 import asyncio
 import yt_dlp
 import os
+import re
 
 FFMPEG_OPTIONS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
@@ -13,9 +14,9 @@ YDL_OPTIONS = {
     'format': 'bestaudio/best',
     'quiet': True,
     'no_warnings': True,
-    'noplaylist': True,
-    'default_search': 'ytsearch',
+    'noplaylist': False,
     'source_address': '0.0.0.0',
+    'cookiefile': None,
 }
 
 intents = discord.Intents.default()
@@ -26,24 +27,55 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 queues = {}
 
+def is_url(text):
+    return re.match(r'https?://', text) is not None
+
 def get_queue(guild_id):
     if guild_id not in queues:
         queues[guild_id] = []
     return queues[guild_id]
 
+async def extract_info(query):
+    ydl_opts = dict(YDL_OPTIONS)
+    loop = asyncio.get_event_loop()
+
+    if is_url(query):
+        search_query = query
+    else:
+        search_query = f'ytsearch:{query}'
+
+    def _extract():
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(search_query, download=False)
+            if 'entries' in info:
+                info = info['entries'][0]
+            return info['url'], info.get('title', 'Unknown'), info.get('duration', 0)
+
+    return await loop.run_in_executor(None, _extract)
+
 async def play_next(ctx):
     queue = get_queue(ctx.guild.id)
     if queue:
-        url, title = queue.pop(0)
+        url, title, duration = queue.pop(0)
         source = discord.FFmpegPCMAudio(url, **FFMPEG_OPTIONS)
-        ctx.voice_client.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop))
-        await ctx.send(f'Now playing: **{title}**')
+        ctx.voice_client.play(
+            source,
+            after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
+        )
+        mins, secs = divmod(duration, 60)
+        dur_str = f'{mins}:{secs:02d}' if duration else 'Unknown'
+        embed = discord.Embed(title='Now Playing', description=f'**{title}**', color=discord.Color.blurple())
+        embed.add_field(name='Duration', value=dur_str)
+        await ctx.send(embed=embed)
     else:
         await ctx.send('Queue is empty.')
 
 @bot.event
 async def on_ready():
     print(f'Bot is ready: {bot.user}')
+    await bot.change_presence(
+        activity=discord.Activity(type=discord.ActivityType.listening, name='!play')
+    )
 
 @bot.command(name='play', aliases=['p'])
 async def play(ctx, *, query):
@@ -58,28 +90,37 @@ async def play(ctx, *, query):
     elif ctx.voice_client.channel != voice_channel:
         await ctx.voice_client.move_to(voice_channel)
 
-    await ctx.send(f'Searching for: **{query}**...')
+    msg = await ctx.send(f'Searching: **{query}**...')
 
-    with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
-        info = ydl.extract_info(f'ytsearch:{query}', download=False)
-        if 'entries' in info:
-            info = info['entries'][0]
-        url = info['url']
-        title = info.get('title', 'Unknown')
+    try:
+        url, title, duration = await extract_info(query)
+    except Exception as e:
+        await msg.edit(content=f'Error: Could not find or play that. `{e}`')
+        return
 
     queue = get_queue(ctx.guild.id)
+    mins, secs = divmod(duration, 60)
+    dur_str = f'{mins}:{secs:02d}' if duration else 'Unknown'
 
-    if ctx.voice_client.is_playing():
-        queue.append((url, title))
-        await ctx.send(f'Added to queue: **{title}** (Position: {len(queue)})')
+    if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
+        queue.append((url, title, duration))
+        embed = discord.Embed(title='Added to Queue', description=f'**{title}**', color=discord.Color.green())
+        embed.add_field(name='Position', value=str(len(queue)))
+        embed.add_field(name='Duration', value=dur_str)
+        await msg.edit(content=None, embed=embed)
     else:
         source = discord.FFmpegPCMAudio(url, **FFMPEG_OPTIONS)
-        ctx.voice_client.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop))
-        await ctx.send(f'Now playing: **{title}**')
+        ctx.voice_client.play(
+            source,
+            after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
+        )
+        embed = discord.Embed(title='Now Playing', description=f'**{title}**', color=discord.Color.blurple())
+        embed.add_field(name='Duration', value=dur_str)
+        await msg.edit(content=None, embed=embed)
 
 @bot.command(name='skip', aliases=['s'])
 async def skip(ctx):
-    if ctx.voice_client and ctx.voice_client.is_playing():
+    if ctx.voice_client and (ctx.voice_client.is_playing() or ctx.voice_client.is_paused()):
         ctx.voice_client.stop()
         await ctx.send('Skipped!')
     else:
@@ -91,10 +132,14 @@ async def show_queue(ctx):
     if not queue:
         await ctx.send('Queue is empty.')
         return
-    msg = '**Queue:**\n'
-    for i, (url, title) in enumerate(queue, 1):
-        msg += f'{i}. {title}\n'
-    await ctx.send(msg)
+    embed = discord.Embed(title='Queue', color=discord.Color.blurple())
+    for i, (url, title, duration) in enumerate(queue[:10], 1):
+        mins, secs = divmod(duration, 60)
+        dur_str = f'{mins}:{secs:02d}' if duration else '?'
+        embed.add_field(name=f'{i}. {title}', value=f'Duration: {dur_str}', inline=False)
+    if len(queue) > 10:
+        embed.set_footer(text=f'...and {len(queue) - 10} more')
+    await ctx.send(embed=embed)
 
 @bot.command(name='stop')
 async def stop(ctx):
@@ -125,20 +170,26 @@ async def resume(ctx):
 @bot.command(name='nowplaying', aliases=['np'])
 async def nowplaying(ctx):
     if ctx.voice_client and ctx.voice_client.is_playing():
-        await ctx.send('A song is currently playing.')
+        await ctx.send('A song is currently playing. Use `!queue` to see the queue.')
     else:
         await ctx.send('Nothing is playing right now.')
 
-@bot.command(name='help_music', aliases=['commands'])
+@bot.command(name='clear', aliases=['cl'])
+async def clear_queue(ctx):
+    queues[ctx.guild.id] = []
+    await ctx.send('Queue cleared!')
+
+@bot.command(name='help_music', aliases=['commands', 'h'])
 async def help_music(ctx):
     embed = discord.Embed(title='Music Bot Commands', color=discord.Color.blurple())
-    embed.add_field(name='!play <song>', value='Play a song or add to queue', inline=False)
-    embed.add_field(name='!skip', value='Skip current song', inline=False)
-    embed.add_field(name='!queue', value='Show current queue', inline=False)
+    embed.add_field(name='!play <song or YouTube URL>', value='Play a song by name or paste a YouTube link', inline=False)
+    embed.add_field(name='!skip  (!s)', value='Skip current song', inline=False)
+    embed.add_field(name='!queue  (!q)', value='Show current queue', inline=False)
     embed.add_field(name='!pause', value='Pause the song', inline=False)
     embed.add_field(name='!resume', value='Resume the song', inline=False)
     embed.add_field(name='!stop', value='Stop and disconnect', inline=False)
-    embed.add_field(name='!nowplaying', value='Show current song', inline=False)
+    embed.add_field(name='!clear', value='Clear the queue', inline=False)
+    embed.add_field(name='!nowplaying  (!np)', value='Show current song info', inline=False)
     await ctx.send(embed=embed)
 
 TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
