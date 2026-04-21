@@ -38,25 +38,18 @@ FFMPEG_OPTIONS = '-vn -b:a 128k'
 COOKIES_FILE = os.path.join(os.path.dirname(__file__), 'cookies.txt')
 
 PIPED_INSTANCES = [
-    'https://pipedapi.kavin.rocks',
-    'https://pipedapi.r4fo.com',
-    'https://pipedapi.adminforge.de',
-    'https://pipedapi.darkness.services',
-    'https://pipedapi.leptons.xyz',
     'https://api.piped.private.coffee',
-    'https://pipedapi.reallyaweso.me',
-    'https://pipedapi.smnz.de',
-    'https://api-piped.mha.fi',
+    'https://pipedapi.kavin.rocks',
+    'https://pipedapi.adminforge.de',
+    'https://pipedapi.leptons.xyz',
+    'https://pipedapi.r4fo.com',
 ]
 
 INVIDIOUS_INSTANCES = [
     'https://invidious.nerdvpn.de',
     'https://invidious.privacyredirect.com',
-    'https://iv.melmac.space',
     'https://inv.nadeko.net',
-    'https://invidious.materialio.us',
     'https://invidious.f5.si',
-    'https://invidious.jing.rocks',
     'https://yewtu.be',
 ]
 
@@ -70,7 +63,7 @@ YT_CLIENT_FALLBACKS = [
 ]
 
 
-def http_get_json(url, timeout=8):
+def http_get_json(url, timeout=6):
     req = urllib.request.Request(url, headers={
         'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile',
         'Accept': 'application/json',
@@ -82,6 +75,28 @@ def http_get_json(url, timeout=8):
 def extract_video_id(s):
     m = re.search(r'(?:v=|youtu\.be/|/shorts/|/embed/)([A-Za-z0-9_-]{11})', s)
     return m.group(1) if m else None
+
+
+def youtube_html_search(query, n=5):
+    """Scrape youtube.com/results for video IDs. Works from any IP."""
+    url = 'https://www.youtube.com/results?search_query=' + urllib.parse.quote(query)
+    req = urllib.request.Request(url, headers={
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9',
+    })
+    with urllib.request.urlopen(req, timeout=10) as r:
+        html = r.read().decode('utf-8', 'ignore')
+    ids = re.findall(r'"videoId":"([A-Za-z0-9_-]{11})"', html)
+    seen = set()
+    out = []
+    for v in ids:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+        if len(out) >= n:
+            break
+    return out
 
 
 def make_ydl_opts(client):
@@ -104,50 +119,57 @@ def make_ydl_opts(client):
 
 
 def fetch_via_ytdlp(query):
-    search = query.strip() if re.match(r'https?://', query.strip()) else 'ytsearch1:' + query
-    last_err = None
-    for client in YT_CLIENT_FALLBACKS:
+    q = query.strip()
+    if re.match(r'https?://', q):
+        targets = [q]
+    else:
         try:
-            with yt_dlp.YoutubeDL(make_ydl_opts(client)) as ydl:
-                data = ydl.extract_info(search, download=False)
-                if 'entries' in data:
-                    if not data['entries']:
-                        raise RuntimeError('no results')
-                    data = data['entries'][0]
-                if not data.get('url'):
-                    raise RuntimeError('no stream url')
-                log.info('ytdlp ok client=%s', client)
-                return {
-                    'url': data['url'],
-                    'title': data.get('title', 'Unknown'),
-                    'duration': data.get('duration', 0),
-                    'thumbnail': data.get('thumbnail'),
-                    'webpage_url': data.get('webpage_url', ''),
-                    'uploader': data.get('uploader', 'Unknown'),
-                }
+            ids = youtube_html_search(q, n=5)
         except Exception as e:
-            last_err = e
-            log.warning('ytdlp client=%s fail: %s', client, e)
+            log.warning('html search failed: %s', e)
+            ids = []
+        if not ids:
+            raise RuntimeError('no results')
+        targets = ['https://www.youtube.com/watch?v=' + v for v in ids]
+
+    last_err = None
+    for target in targets:
+        for client in YT_CLIENT_FALLBACKS:
+            try:
+                with yt_dlp.YoutubeDL(make_ydl_opts(client)) as ydl:
+                    data = ydl.extract_info(target, download=False)
+                    if 'entries' in data:
+                        if not data['entries']:
+                            raise RuntimeError('no entries')
+                        data = data['entries'][0]
+                    if not data.get('url'):
+                        raise RuntimeError('no stream url')
+                    log.info('ytdlp ok client=%s url=%s', client, target)
+                    return {
+                        'url': data['url'],
+                        'title': data.get('title', 'Unknown'),
+                        'duration': data.get('duration', 0),
+                        'thumbnail': data.get('thumbnail'),
+                        'webpage_url': data.get('webpage_url', target),
+                        'uploader': data.get('uploader', 'Unknown'),
+                    }
+            except Exception as e:
+                last_err = e
+                log.warning('ytdlp client=%s target=%s fail: %s', client, target, e)
     raise RuntimeError('ytdlp failed: ' + str(last_err))
 
 
 def fetch_via_piped(query):
     vid = extract_video_id(query)
+    if not vid:
+        ids = youtube_html_search(query, n=1)
+        if not ids:
+            raise RuntimeError('no search results')
+        vid = ids[0]
     last_err = None
     for inst in PIPED_INSTANCES:
         try:
-            if not vid:
-                s = http_get_json(inst + '/search?q=' + urllib.parse.quote(query) + '&filter=music_songs')
-                items = s.get('items') or []
-                if not items:
-                    s = http_get_json(inst + '/search?q=' + urllib.parse.quote(query) + '&filter=videos')
-                    items = s.get('items') or []
-                if not items:
-                    raise RuntimeError('no search results')
-                first = next((it for it in items if it.get('url', '').startswith('/watch?v=')), items[0])
-                vid_local = first['url'].split('v=')[-1].split('&')[0]
-            else:
-                vid_local = vid
+            vid_local = vid
             streams = http_get_json(inst + '/streams/' + vid_local)
             audio = streams.get('audioStreams') or []
             if not audio:
@@ -171,16 +193,15 @@ def fetch_via_piped(query):
 
 def fetch_via_invidious(query):
     vid = extract_video_id(query)
+    if not vid:
+        ids = youtube_html_search(query, n=1)
+        if not ids:
+            raise RuntimeError('no search results')
+        vid = ids[0]
     last_err = None
     for inst in INVIDIOUS_INSTANCES:
         try:
-            if not vid:
-                s = http_get_json(inst + '/api/v1/search?q=' + urllib.parse.quote(query) + '&type=video')
-                if not s:
-                    raise RuntimeError('no results')
-                vid_local = s[0]['videoId']
-            else:
-                vid_local = vid
+            vid_local = vid
             v = http_get_json(inst + '/api/v1/videos/' + vid_local)
             fmts = v.get('adaptiveFormats') or []
             audio_fmts = [f for f in fmts if 'audio' in (f.get('type') or '')]
