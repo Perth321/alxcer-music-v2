@@ -155,6 +155,7 @@ def fetch_via_soundcloud(query):
         'thumbnail': info.get('thumbnail') or thumb,
         'webpage_url': track_url,
         'uploader': info.get('uploader', uploader) or uploader,
+        'query': query,
     }
 
 
@@ -233,6 +234,7 @@ def fetch_via_ytdlp(query):
                         'thumbnail': data.get('thumbnail'),
                         'webpage_url': data.get('webpage_url', target),
                         'uploader': data.get('uploader', 'Unknown'),
+                        'query': query,
                     }
             except Exception as e:
                 last_err = e
@@ -265,6 +267,7 @@ def fetch_via_piped(query):
                 'thumbnail': streams.get('thumbnailUrl'),
                 'webpage_url': 'https://youtube.com/watch?v=' + vid_local,
                 'uploader': streams.get('uploader', 'Unknown'),
+                'query': query,
             }
         except Exception as e:
             last_err = e
@@ -298,6 +301,7 @@ def fetch_via_invidious(query):
                 'thumbnail': (v.get('videoThumbnails') or [{}])[0].get('url'),
                 'webpage_url': 'https://youtube.com/watch?v=' + vid_local,
                 'uploader': v.get('author', 'Unknown'),
+                'query': query,
             }
         except Exception as e:
             last_err = e
@@ -330,12 +334,34 @@ bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 
 queues = {}
 now_playing = {}
+loop_mode = {}  # guild_id -> 'off' | 'one' | 'all'
+
+LOOP_LABELS = {
+    'off': 'ปิด',
+    'one': '🔂 1 เพลง',
+    'all': '🔁 ทั้งคิว',
+}
 
 
 def get_queue(guild_id):
     if guild_id not in queues:
         queues[guild_id] = []
     return queues[guild_id]
+
+
+def get_loop(guild_id):
+    return loop_mode.get(guild_id, 'off')
+
+
+def set_loop(guild_id, mode):
+    loop_mode[guild_id] = mode
+
+
+def cycle_loop(guild_id):
+    cur = get_loop(guild_id)
+    nxt = {'off': 'one', 'one': 'all', 'all': 'off'}[cur]
+    set_loop(guild_id, nxt)
+    return nxt
 
 
 def fmt_duration(seconds):
@@ -349,7 +375,7 @@ def fmt_duration(seconds):
     return str(m) + ':' + str(sec).zfill(2)
 
 
-def make_np_embed(track):
+def make_np_embed(track, guild_id=None):
     embed = discord.Embed(
         title='🎵 กำลังเล่นเพลง',
         description='**[' + track['title'] + '](' + track['webpage_url'] + ')**',
@@ -357,9 +383,95 @@ def make_np_embed(track):
     )
     embed.add_field(name='⏱ ความยาว', value=fmt_duration(track['duration']), inline=True)
     embed.add_field(name='🎤 ช่อง', value=track['uploader'], inline=True)
+    if guild_id is not None:
+        embed.add_field(name='🔁 Loop', value=LOOP_LABELS[get_loop(guild_id)], inline=True)
     if track.get('thumbnail'):
         embed.set_thumbnail(url=track['thumbnail'])
     return embed
+
+
+class PlayerView(discord.ui.View):
+    def __init__(self, ctx):
+        super().__init__(timeout=None)
+        self.ctx = ctx
+        self._refresh_loop_button()
+
+    def _refresh_loop_button(self):
+        mode = get_loop(self.ctx.guild.id)
+        for child in self.children:
+            if getattr(child, 'custom_id', None) == 'loop':
+                if mode == 'off':
+                    child.label = 'Loop: Off'
+                    child.emoji = '🔁'
+                    child.style = discord.ButtonStyle.secondary
+                elif mode == 'one':
+                    child.label = 'Loop: 1 เพลง'
+                    child.emoji = '🔂'
+                    child.style = discord.ButtonStyle.success
+                else:
+                    child.label = 'Loop: ทั้งคิว'
+                    child.emoji = '🔁'
+                    child.style = discord.ButtonStyle.success
+
+    async def _ack(self, interaction):
+        try:
+            await interaction.response.defer()
+        except Exception:
+            pass
+
+    @discord.ui.button(emoji='⏯️', label='Pause/Resume', style=discord.ButtonStyle.primary, custom_id='pp')
+    async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._ack(interaction)
+        vc = self.ctx.voice_client
+        if not vc:
+            await interaction.followup.send('❌ บอทไม่ได้อยู่ใน voice', ephemeral=True)
+            return
+        if vc.is_playing():
+            vc.pause()
+            await interaction.followup.send('⏸️ หยุดชั่วคราว', ephemeral=True)
+        elif vc.is_paused():
+            vc.resume()
+            await interaction.followup.send('▶️ เล่นต่อ', ephemeral=True)
+        else:
+            await interaction.followup.send('❌ ไม่มีเพลงเล่นอยู่', ephemeral=True)
+
+    @discord.ui.button(emoji='⏭️', label='Skip', style=discord.ButtonStyle.primary, custom_id='skip')
+    async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._ack(interaction)
+        vc = self.ctx.voice_client
+        if vc and (vc.is_playing() or vc.is_paused()):
+            vc.stop()
+            await interaction.followup.send('⏭️ ข้ามเพลง', ephemeral=True)
+        else:
+            await interaction.followup.send('❌ ไม่มีเพลงเล่นอยู่', ephemeral=True)
+
+    @discord.ui.button(emoji='🔁', label='Loop: Off', style=discord.ButtonStyle.secondary, custom_id='loop')
+    async def loop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._ack(interaction)
+        mode = cycle_loop(self.ctx.guild.id)
+        self._refresh_loop_button()
+        try:
+            await interaction.message.edit(view=self)
+        except Exception:
+            pass
+        await interaction.followup.send('🔁 เปลี่ยนโหมด Loop เป็น: **' + LOOP_LABELS[mode] + '**', ephemeral=True)
+
+    @discord.ui.button(emoji='⏹️', label='Stop', style=discord.ButtonStyle.danger, custom_id='stop')
+    async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._ack(interaction)
+        vc = self.ctx.voice_client
+        if vc:
+            queues[self.ctx.guild.id] = []
+            now_playing.pop(self.ctx.guild.id, None)
+            set_loop(self.ctx.guild.id, 'off')
+            vc.stop()
+            try:
+                await vc.disconnect(force=True)
+            except Exception:
+                pass
+            await interaction.followup.send('⏹️ หยุดและออกจาก voice แล้ว', ephemeral=True)
+        else:
+            await interaction.followup.send('❌ บอทไม่ได้อยู่ใน voice', ephemeral=True)
 
 
 async def ensure_voice(ctx):
@@ -388,30 +500,58 @@ async def ensure_voice(ctx):
     raise RuntimeError('voice connect failed after 4 attempts')
 
 
-async def play_next(ctx):
-    queue = get_queue(ctx.guild.id)
-    if not queue:
-        now_playing.pop(ctx.guild.id, None)
-        return
+async def _start_playback(ctx, track):
+    """Start playing the given track on the current voice client."""
+    vc = ctx.voice_client
+    if not vc or not vc.is_connected():
+        log.warning('no voice client when starting playback')
+        return False
+    source = discord.FFmpegPCMAudio(
+        track['url'],
+        before_options=FFMPEG_BEFORE,
+        options=FFMPEG_OPTIONS,
+    )
+    vc.play(
+        source,
+        after=lambda err: (log.warning('after-play err: %s', err) if err else None,
+                            asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)),
+    )
+    return True
 
-    track = queue.pop(0)
-    now_playing[ctx.guild.id] = track
+
+async def play_next(ctx):
+    guild_id = ctx.guild.id
+    mode = get_loop(guild_id)
+    current = now_playing.get(guild_id)
+    queue = get_queue(guild_id)
+
+    # Decide next track based on loop mode
+    if mode == 'one' and current:
+        next_track = current
+    else:
+        if mode == 'all' and current:
+            queue.append(current)
+        if not queue:
+            now_playing.pop(guild_id, None)
+            return
+        next_track = queue.pop(0)
+
+    now_playing[guild_id] = next_track
+
+    # Re-resolve stream URL if it might be expired (re-fetch on every loop iteration of same song)
+    needs_refetch = (mode == 'one') or (mode == 'all' and next_track is current)
+    if needs_refetch and next_track.get('query'):
+        try:
+            fresh = await fetch_track(next_track['query'])
+            next_track['url'] = fresh['url']
+        except Exception as e:
+            log.warning('re-fetch for loop failed: %s', e)
 
     try:
-        if not ctx.voice_client or not ctx.voice_client.is_connected():
-            log.warning('no voice client when playing next; skipping')
+        ok = await _start_playback(ctx, next_track)
+        if not ok:
             return
-        source = discord.FFmpegPCMAudio(
-            track['url'],
-            before_options=FFMPEG_BEFORE,
-            options=FFMPEG_OPTIONS,
-        )
-        ctx.voice_client.play(
-            source,
-            after=lambda err: (log.warning('after-play err: %s', err) if err else None,
-                                asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)),
-        )
-        await ctx.send(embed=make_np_embed(track))
+        await ctx.send(embed=make_np_embed(next_track, guild_id), view=PlayerView(ctx))
     except Exception as e:
         log.exception('play_next error')
         try:
@@ -487,17 +627,11 @@ async def play(ctx, *, query):
     else:
         now_playing[ctx.guild.id] = track
         try:
-            source = discord.FFmpegPCMAudio(
-                track['url'],
-                before_options=FFMPEG_BEFORE,
-                options=FFMPEG_OPTIONS,
-            )
-            vc.play(
-                source,
-                after=lambda err: (log.warning('after-play err: %s', err) if err else None,
-                                    asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)),
-            )
-            await status.edit(content=None, embed=make_np_embed(track))
+            ok = await _start_playback(ctx, track)
+            if not ok:
+                await status.edit(content='❌ เริ่มเล่นไม่ได้ (voice ไม่พร้อม)')
+                return
+            await status.edit(content=None, embed=make_np_embed(track, ctx.guild.id), view=PlayerView(ctx))
         except Exception as e:
             log.exception('play start error')
             await status.edit(content='❌ เริ่มเล่นไม่ได้: ' + str(e))
@@ -517,6 +651,7 @@ async def show_queue(ctx):
     queue = get_queue(ctx.guild.id)
     np = now_playing.get(ctx.guild.id)
     embed = discord.Embed(title='📋 คิวเพลง', color=0x5865F2)
+    embed.add_field(name='🔁 Loop', value=LOOP_LABELS[get_loop(ctx.guild.id)], inline=False)
     if np:
         embed.add_field(name='🎵 กำลังเล่น',
             value='**' + np['title'] + '**  ' + fmt_duration(np['duration']),
@@ -540,7 +675,7 @@ async def nowplaying(ctx):
     if not track:
         await ctx.send('❌ ไม่มีเพลงเล่นอยู่')
         return
-    await ctx.send(embed=make_np_embed(track))
+    await ctx.send(embed=make_np_embed(track, ctx.guild.id), view=PlayerView(ctx))
 
 
 @bot.command(name='pause')
@@ -561,6 +696,28 @@ async def resume(ctx):
         await ctx.send('❌ ไม่มีเพลงที่หยุดไว้')
 
 
+@bot.command(name='loop', aliases=['l'])
+async def loop_cmd(ctx, mode: str = None):
+    """!loop [off|one|all]  — ไม่ใส่ค่าจะหมุนสลับโหมด"""
+    valid = {'off', 'one', 'all'}
+    aliases = {
+        'no': 'off', 'none': 'off', '0': 'off',
+        '1': 'one', 'single': 'one', 'song': 'one', 'track': 'one',
+        'queue': 'all', 'q': 'all', 'a': 'all',
+    }
+    if mode is None:
+        new_mode = cycle_loop(ctx.guild.id)
+    else:
+        m = mode.lower()
+        m = aliases.get(m, m)
+        if m not in valid:
+            await ctx.send('❌ ใช้: !loop off | one | all')
+            return
+        set_loop(ctx.guild.id, m)
+        new_mode = m
+    await ctx.send('🔁 โหมด Loop: **' + LOOP_LABELS[new_mode] + '**')
+
+
 @bot.command(name='clear', aliases=['cl'])
 async def clear_queue(ctx):
     queues[ctx.guild.id] = []
@@ -572,6 +729,7 @@ async def leave(ctx):
     if ctx.voice_client:
         queues[ctx.guild.id] = []
         now_playing.pop(ctx.guild.id, None)
+        set_loop(ctx.guild.id, 'off')
         await ctx.voice_client.disconnect(force=True)
         await ctx.send('👋 ออกจาก voice channel แล้ว')
     else:
@@ -583,6 +741,7 @@ async def stop(ctx):
     if ctx.voice_client:
         queues[ctx.guild.id] = []
         now_playing.pop(ctx.guild.id, None)
+        set_loop(ctx.guild.id, 'off')
         ctx.voice_client.stop()
         await ctx.voice_client.disconnect(force=True)
         await ctx.send('⏹️ หยุดและออกจาก voice channel แล้ว')
@@ -614,12 +773,14 @@ async def help_cmd(ctx):
     embed.add_field(name='!play <ชื่อเพลง หรือ link>', value='เล่นเพลง / เพิ่มเข้าคิว', inline=False)
     embed.add_field(name='!skip  (!s)', value='ข้ามเพลง', inline=False)
     embed.add_field(name='!queue  (!q)', value='ดูคิวเพลง', inline=False)
-    embed.add_field(name='!np', value='ดูเพลงที่เล่นอยู่', inline=False)
+    embed.add_field(name='!np', value='ดูเพลงที่เล่นอยู่ + ปุ่มควบคุม', inline=False)
+    embed.add_field(name='!loop [off|one|all]', value='ตั้งโหมด Loop (one = วนเพลงเดียว, all = วนทั้งคิว)', inline=False)
     embed.add_field(name='!pause / !resume', value='หยุดชั่วคราว / เล่นต่อ', inline=False)
     embed.add_field(name='!reconnect (!rc)', value='เชื่อมต่อ voice ใหม่ถ้าหลุด', inline=False)
     embed.add_field(name='!clear', value='ล้างคิว', inline=False)
     embed.add_field(name='!leave  (!dc)', value='ออกจาก voice channel', inline=False)
     embed.add_field(name='!stop', value='หยุดเพลง + ออก voice channel', inline=False)
+    embed.set_footer(text='ปุ่มใต้ข้อความ "กำลังเล่นเพลง": ⏯️ Pause/Resume  ⏭️ Skip  🔁 Loop  ⏹️ Stop')
     await ctx.send(embed=embed)
 
 
