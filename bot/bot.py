@@ -43,7 +43,8 @@ FFMPEG_BEFORE = (
     '-reconnect_on_http_error 4xx,5xx -reconnect_delay_max 30 '
     '-rw_timeout 15000000'
 )
-FFMPEG_OPTIONS = '-vn -b:a 128k'
+FFMPEG_TRANSCODE_OPTIONS = '-vn -strict -2'
+FFMPEG_COPY_OPTIONS = '-vn'
 COOKIES_FILE = os.path.join(os.path.dirname(__file__), 'cookies.txt')
 
 _cookies_env = os.environ.get('YOUTUBE_COOKIES', '')
@@ -350,11 +351,13 @@ def fetch_via_piped(query):
             audio = streams.get('audioStreams') or []
             if not audio:
                 raise RuntimeError('no audio streams')
-            # Prefer streams with higher bitrate
-            audio.sort(key=lambda a: a.get('bitrate', 0), reverse=True)
-            best = audio[0]
+            opus_audio = [a for a in audio if (a.get('codec') or '').lower() == 'opus']
+            candidates = opus_audio or audio
+            candidates.sort(key=lambda a: a.get('bitrate', 0), reverse=True)
+            best = candidates[0]
             stream_url = best['url']
-            log.info('piped ok via %s bitrate=%s', inst, best.get('bitrate'))
+            codec = (best.get('codec') or '').lower()
+            log.info('piped ok via %s codec=%s bitrate=%s', inst, codec, best.get('bitrate'))
             return {
                 'url': stream_url,
                 'title': streams.get('title', 'Unknown'),
@@ -362,6 +365,7 @@ def fetch_via_piped(query):
                 'thumbnail': streams.get('thumbnailUrl'),
                 'webpage_url': 'https://youtube.com/watch?v=' + vid,
                 'uploader': streams.get('uploader', 'Unknown'),
+                'codec': codec,
                 'query': query,
             }
         except Exception as e:
@@ -783,11 +787,15 @@ async def _start_playback(ctx, track):
     vc = ctx.voice_client
     if not vc or not vc.is_connected():
         return False
+    codec = 'copy' if (track.get('codec') or '').lower() == 'opus' else 'opus'
+    options = FFMPEG_COPY_OPTIONS if codec == 'copy' else FFMPEG_TRANSCODE_OPTIONS
+    log.info('starting playback: codec=%s title=%s', codec, track.get('title'))
     source = discord.FFmpegOpusAudio(
         track['url'],
         executable=FFMPEG_EXECUTABLE,
         before_options=FFMPEG_BEFORE,
-        options=FFMPEG_OPTIONS,
+        options=options,
+        codec=codec,
         bitrate=128,
     )
     vc.play(source, after=lambda err: (
@@ -820,6 +828,7 @@ async def play_next(ctx):
         try:
             fresh = await fetch_track(next_track['query'])
             next_track['url'] = fresh['url']
+            next_track['codec'] = fresh.get('codec')
         except Exception as e:
             log.warning('re-fetch failed: %s', e)
 
