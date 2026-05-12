@@ -133,7 +133,6 @@ def fetch_via_soundcloud(query):
         thumb = t.get('artwork_url')
         uploader = (t.get('user') or {}).get('username', 'SoundCloud')
 
-    # Use yt-dlp to extract the actual stream URL (handles SoundCloud cleanly, no auth)
     opts = {
         'format': 'bestaudio/best',
         'quiet': True,
@@ -157,6 +156,41 @@ def fetch_via_soundcloud(query):
         'uploader': info.get('uploader', uploader) or uploader,
         'query': query,
     }
+
+
+def fetch_spotify_info(url):
+    """
+    Scrape Spotify Open Graph tags to get track/artist name,
+    then return a search query for YouTube.
+    """
+    req = urllib.request.Request(url, headers={
+        'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+        'Accept-Language': 'en-US,en;q=0.9',
+    })
+    with urllib.request.urlopen(req, timeout=10) as r:
+        html = r.read().decode('utf-8', 'ignore')
+
+    title = re.search(r'<meta[^>]+property="og:title"[^>]+content="([^"]+)"', html)
+    desc = re.search(r'<meta[^>]+property="og:description"[^>]+content="([^"]+)"', html)
+    thumb = re.search(r'<meta[^>]+property="og:image"[^>]+content="([^"]+)"', html)
+
+    og_title = title.group(1) if title else None
+    og_desc = desc.group(1) if desc else ''
+    og_thumb = thumb.group(1) if thumb else None
+
+    if not og_title:
+        raise RuntimeError('could not scrape Spotify track info')
+
+    # Description usually contains "Song · Artist · Year"
+    artist = ''
+    if og_desc:
+        parts = [p.strip() for p in og_desc.split('·')]
+        if len(parts) >= 2:
+            artist = parts[1]
+
+    search_query = (og_title + ' ' + artist).strip()
+    log.info('spotify scraped: title=%s artist=%s', og_title, artist)
+    return search_query, og_title, og_thumb
 
 
 def youtube_html_search(query, n=5):
@@ -309,17 +343,72 @@ def fetch_via_invidious(query):
     raise RuntimeError('invidious failed: ' + str(last_err))
 
 
+def _detect_url_type(q):
+    """Return 'youtube', 'soundcloud', 'spotify', 'other_url', or 'search'."""
+    if not re.match(r'https?://', q):
+        return 'search'
+    if re.search(r'(youtube\.com|youtu\.be)', q):
+        return 'youtube'
+    if 'soundcloud.com' in q:
+        return 'soundcloud'
+    if 'spotify.com' in q:
+        return 'spotify'
+    return 'other_url'
+
+
 async def fetch_track(query):
     loop = asyncio.get_event_loop()
 
     def _run():
+        q = query.strip()
+        url_type = _detect_url_type(q)
         errors = []
-        for fn, name in [(fetch_via_soundcloud, 'soundcloud'),
-                         (fetch_via_ytdlp, 'ytdlp'),
-                         (fetch_via_piped, 'piped'),
-                         (fetch_via_invidious, 'invidious')]:
+
+        if url_type == 'soundcloud':
+            # SoundCloud URL → soundcloud first, ytdlp fallback
+            for fn, name in [(fetch_via_soundcloud, 'soundcloud'), (fetch_via_ytdlp, 'ytdlp')]:
+                try:
+                    return fn(q)
+                except Exception as e:
+                    errors.append(name + ': ' + str(e))
+            raise RuntimeError(' | '.join(errors))
+
+        if url_type == 'spotify':
+            # Spotify URL → scrape title/artist then search YouTube
             try:
-                return fn(query)
+                search_q, sp_title, sp_thumb = fetch_spotify_info(q)
+                log.info('spotify → searching youtube for: %s', search_q)
+                result = None
+                for fn, name in [(fetch_via_ytdlp, 'ytdlp'), (fetch_via_piped, 'piped'), (fetch_via_invidious, 'invidious')]:
+                    try:
+                        result = fn(search_q)
+                        break
+                    except Exception as e:
+                        errors.append(name + ': ' + str(e))
+                if result:
+                    # Keep Spotify thumbnail if yt has none
+                    if not result.get('thumbnail') and sp_thumb:
+                        result['thumbnail'] = sp_thumb
+                    result['webpage_url'] = q  # link back to spotify
+                    result['query'] = query
+                    return result
+            except Exception as e:
+                errors.append('spotify: ' + str(e))
+            raise RuntimeError(' | '.join(errors))
+
+        if url_type in ('youtube', 'other_url'):
+            # Direct URL → skip soundcloud search, go straight to ytdlp/piped/invidious
+            for fn, name in [(fetch_via_ytdlp, 'ytdlp'), (fetch_via_piped, 'piped'), (fetch_via_invidious, 'invidious')]:
+                try:
+                    return fn(q)
+                except Exception as e:
+                    errors.append(name + ': ' + str(e))
+            raise RuntimeError(' | '.join(errors))
+
+        # Plain search query → try ytdlp first, then soundcloud, then piped
+        for fn, name in [(fetch_via_ytdlp, 'ytdlp'), (fetch_via_soundcloud, 'soundcloud'), (fetch_via_piped, 'piped')]:
+            try:
+                return fn(q)
             except Exception as e:
                 errors.append(name + ': ' + str(e))
         raise RuntimeError(' | '.join(errors))
@@ -525,7 +614,6 @@ async def play_next(ctx):
     current = now_playing.get(guild_id)
     queue = get_queue(guild_id)
 
-    # Decide next track based on loop mode
     if mode == 'one' and current:
         next_track = current
     else:
@@ -538,7 +626,6 @@ async def play_next(ctx):
 
     now_playing[guild_id] = next_track
 
-    # Re-resolve stream URL if it might be expired (re-fetch on every loop iteration of same song)
     needs_refetch = (mode == 'one') or (mode == 'all' and next_track is current)
     if needs_refetch and next_track.get('query'):
         try:
@@ -596,7 +683,16 @@ async def play(ctx, *, query):
         await ctx.send('❌ เข้า voice channel ก่อนนะ!')
         return
 
-    status = await ctx.send('🔍 กำลังเชื่อมต่อและค้นหา: ' + query + ' ...')
+    url_type = _detect_url_type(query.strip())
+    type_labels = {
+        'youtube': '▶️ YouTube',
+        'soundcloud': '🔶 SoundCloud',
+        'spotify': '🟢 Spotify',
+        'other_url': '🔗 Link',
+        'search': '🔍 ค้นหา',
+    }
+    status_label = type_labels.get(url_type, '🔍 ค้นหา')
+    status = await ctx.send(status_label + ': ' + query + ' ...')
 
     try:
         vc = await ensure_voice(ctx)
@@ -770,7 +866,19 @@ async def reconnect(ctx):
 @bot.command(name='help', aliases=['h', 'commands'])
 async def help_cmd(ctx):
     embed = discord.Embed(title='🎵 คำสั่งทั้งหมด', color=0x5865F2)
-    embed.add_field(name='!play <ชื่อเพลง หรือ link>', value='เล่นเพลง / เพิ่มเข้าคิว', inline=False)
+    embed.add_field(
+        name='!play <ชื่อเพลง หรือ link>',
+        value=(
+            'เล่นเพลง / เพิ่มเข้าคิว\n'
+            'รองรับ: 🔍 ค้นหา · ▶️ YouTube · 🟢 Spotify · 🔶 SoundCloud · 🔗 link อื่นๆ\n'
+            'ตัวอย่าง:\n'
+            '`!play จี๋หอย`\n'
+            '`!play https://youtu.be/dQw4w9WgXcQ`\n'
+            '`!play https://open.spotify.com/track/...`\n'
+            '`!play https://soundcloud.com/...`'
+        ),
+        inline=False,
+    )
     embed.add_field(name='!skip  (!s)', value='ข้ามเพลง', inline=False)
     embed.add_field(name='!queue  (!q)', value='ดูคิวเพลง', inline=False)
     embed.add_field(name='!np', value='ดูเพลงที่เล่นอยู่ + ปุ่มควบคุม', inline=False)
