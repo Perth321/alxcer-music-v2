@@ -34,44 +34,39 @@ FFMPEG_BEFORE = (
     '-rw_timeout 15000000'
 )
 FFMPEG_OPTIONS = '-vn -b:a 128k'
-
 COOKIES_FILE = os.path.join(os.path.dirname(__file__), 'cookies.txt')
 
-# Write cookies from env var if available (base64-encoded Netscape cookie file)
-_cookies_env = os.environ.get('YOUTUBE_COOKIES_B64', '')
+_cookies_env = os.environ.get('YOUTUBE_COOKIES', '')
 if _cookies_env and not os.path.exists(COOKIES_FILE):
     try:
-        with open(COOKIES_FILE, 'wb') as _f:
-            _f.write(base64.b64decode(_cookies_env))
-        log.info('cookies.txt written from YOUTUBE_COOKIES_B64')
+        with open(COOKIES_FILE, 'w') as _f:
+            _f.write(_cookies_env)
+        log.info('cookies.txt written from YOUTUBE_COOKIES secret (%d bytes)', len(_cookies_env))
     except Exception as _e:
         log.warning('failed to write cookies: %s', _e)
 
-# Only working Piped instances (verified)
+# Piped instances — primary YouTube source (their servers extract, not GitHub Actions IP)
 PIPED_INSTANCES = [
     'https://api.piped.projectsegfau.lt',
     'https://pipedapi.tokhmi.xyz',
+    'https://pipedapi.kavin.rocks',
     'https://pipedapi.adminforge.de',
     'https://pipedapi.syncpundit.io',
+    'https://pipedapi.drgns.space',
+    'https://piped-api.garudalinux.org',
+    'https://pa.il.shn.hk',
+    'https://pipedapi.lunar.icu',
+    'https://piped.drgns.space',
 ]
 
-# Invidious — kept as last-resort fallback
+# Invidious — last resort
 INVIDIOUS_INSTANCES = [
     'https://invidious.privacyredirect.com',
     'https://invidious.nerdvpn.de',
     'https://inv.nadeko.net',
     'https://yewtu.be',
-]
-
-# Try each client individually — tv_embedded first (no sign-in required)
-YT_CLIENTS_ORDER = [
-    'tv_embedded',
-    'web_embedded',
-    'tv',
-    'android',
-    'ios',
-    'mweb',
-    'web',
+    'https://invidious.io.lol',
+    'https://invidious.f5.si',
 ]
 
 
@@ -121,6 +116,7 @@ def get_soundcloud_client_id():
 
 
 def fetch_via_soundcloud(query):
+    """SoundCloud — works reliably without any auth, great for Thai music."""
     q = query.strip()
     if 'soundcloud.com' in q and re.match(r'https?://', q):
         track_url = q
@@ -135,7 +131,7 @@ def fetch_via_soundcloud(query):
         data = http_get_json(url, timeout=10)
         items = [t for t in (data.get('collection') or []) if t.get('streamable')]
         if not items:
-            raise RuntimeError('no results')
+            raise RuntimeError('no SC results')
         t = items[0]
         track_url = t['permalink_url']
         title = t.get('title', 'Unknown')
@@ -155,7 +151,7 @@ def fetch_via_soundcloud(query):
     if 'entries' in info:
         info = info['entries'][0]
     if not info.get('url'):
-        raise RuntimeError('no stream url from yt-dlp')
+        raise RuntimeError('no stream url')
     log.info('soundcloud ok: %s', title)
     return {
         'url': info['url'],
@@ -168,37 +164,11 @@ def fetch_via_soundcloud(query):
     }
 
 
-def fetch_spotify_info(url):
-    req = urllib.request.Request(url, headers={
-        'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
-        'Accept-Language': 'en-US,en;q=0.9',
-    })
-    with urllib.request.urlopen(req, timeout=10) as r:
-        html = r.read().decode('utf-8', 'ignore')
-    title = re.search(r'<meta[^>]+property="og:title"[^>]+content="([^"]+)"', html)
-    desc = re.search(r'<meta[^>]+property="og:description"[^>]+content="([^"]+)"', html)
-    thumb = re.search(r'<meta[^>]+property="og:image"[^>]+content="([^"]+)"', html)
-    og_title = title.group(1) if title else None
-    og_desc = desc.group(1) if desc else ''
-    og_thumb = thumb.group(1) if thumb else None
-    if not og_title:
-        raise RuntimeError('could not scrape Spotify track info')
-    artist = ''
-    if og_desc:
-        parts = [p.strip() for p in og_desc.split('·')]
-        if len(parts) >= 2:
-            artist = parts[1]
-    search_query = (og_title + ' ' + artist).strip()
-    log.info('spotify scraped: title=%s artist=%s', og_title, artist)
-    return search_query, og_title, og_thumb
-
-
 def youtube_html_search(query, n=5):
     url = 'https://www.youtube.com/results?search_query=' + urllib.parse.quote(query)
     req = urllib.request.Request(url, headers={
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
         'Accept-Language': 'en-US,en;q=0.9',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9',
     })
     with urllib.request.urlopen(req, timeout=10) as r:
         html = r.read().decode('utf-8', 'ignore')
@@ -214,100 +184,51 @@ def youtube_html_search(query, n=5):
     return out
 
 
-def make_ydl_opts(client):
-    opts = {
-        'format': 'bestaudio[ext=m4a]/bestaudio/best',
-        'quiet': True,
-        'no_warnings': True,
-        'noplaylist': True,
-        'source_address': '0.0.0.0',
-        'geo_bypass': True,
-        'nocheckcertificate': True,
-        'extractor_args': {
-            'youtube': {
-                'player_client': [client],
-                'player_skip': ['webpage', 'configs'],
-            }
-        },
-        'http_headers': {
-            'User-Agent': (
-                'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 '
-                '(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36'
-            ),
-        },
-    }
-    if os.path.exists(COOKIES_FILE):
-        opts['cookiefile'] = COOKIES_FILE
-    return opts
-
-
-def fetch_via_ytdlp(query):
-    """Try each YouTube client individually; tv_embedded first (bypasses bot check)."""
-    q = query.strip()
-    if re.match(r'https?://', q):
-        targets = [q]
-    else:
-        try:
-            ids = youtube_html_search(q, n=5)
-        except Exception as e:
-            log.warning('html search failed: %s', e)
-            ids = []
-        if not ids:
-            raise RuntimeError('no results from YouTube search')
-        targets = ['https://www.youtube.com/watch?v=' + v for v in ids]
-
-    last_err = None
-    for client in YT_CLIENTS_ORDER:
-        for target in targets:
-            try:
-                with yt_dlp.YoutubeDL(make_ydl_opts(client)) as ydl:
-                    data = ydl.extract_info(target, download=False)
-                    if 'entries' in data:
-                        if not data['entries']:
-                            continue
-                        data = data['entries'][0]
-                    if not data.get('url'):
-                        continue
-                    log.info('ytdlp ok client=%s target=%s', client, target)
-                    return {
-                        'url': data['url'],
-                        'title': data.get('title', 'Unknown'),
-                        'duration': data.get('duration', 0),
-                        'thumbnail': data.get('thumbnail'),
-                        'webpage_url': data.get('webpage_url', target),
-                        'uploader': data.get('uploader', 'Unknown'),
-                        'query': query,
-                    }
-            except Exception as e:
-                last_err = e
-                # Only log first failure per client to reduce noise
-                log.debug('ytdlp client=%s fail: %s', client, e)
-        log.info('ytdlp client=%s exhausted all targets', client)
-    raise RuntimeError('ytdlp all clients failed: ' + str(last_err))
-
-
 def fetch_via_piped(query):
+    """
+    Piped API — Piped's own servers fetch from YouTube, so GitHub Actions IP
+    is never seen by YouTube. This is the primary YouTube source.
+    """
     vid = extract_video_id(query)
     if not vid:
+        # Search YouTube HTML to find video ID, then use Piped for stream
         try:
-            ids = youtube_html_search(query, n=1)
+            ids = youtube_html_search(query, n=3)
         except Exception:
             ids = []
         if not ids:
-            raise RuntimeError('no search results for piped')
+            # Try Piped search API
+            for inst in PIPED_INSTANCES[:3]:
+                try:
+                    results = http_get_json(
+                        inst + '/search?q=' + urllib.parse.quote(query) + '&filter=videos',
+                        timeout=8,
+                    )
+                    items = results.get('items') or []
+                    vids = [i.get('url', '').split('=')[-1] for i in items if i.get('type') == 'stream']
+                    if vids:
+                        ids = [v for v in vids if len(v) == 11]
+                        break
+                except Exception as e:
+                    log.debug('piped search %s: %s', inst, e)
+        if not ids:
+            raise RuntimeError('no YouTube video ID found for query')
         vid = ids[0]
+
     last_err = None
     for inst in PIPED_INSTANCES:
         try:
-            streams = http_get_json(inst + '/streams/' + vid, timeout=8)
+            streams = http_get_json(inst + '/streams/' + vid, timeout=10)
             audio = streams.get('audioStreams') or []
             if not audio:
                 raise RuntimeError('no audio streams')
+            # Prefer streams with higher bitrate
             audio.sort(key=lambda a: a.get('bitrate', 0), reverse=True)
             best = audio[0]
-            log.info('piped ok via %s', inst)
+            stream_url = best['url']
+            log.info('piped ok via %s bitrate=%s', inst, best.get('bitrate'))
             return {
-                'url': best['url'],
+                'url': stream_url,
                 'title': streams.get('title', 'Unknown'),
                 'duration': streams.get('duration', 0),
                 'thumbnail': streams.get('thumbnailUrl'),
@@ -329,12 +250,12 @@ def fetch_via_invidious(query):
         except Exception:
             ids = []
         if not ids:
-            raise RuntimeError('no search results for invidious')
+            raise RuntimeError('no video ID for invidious')
         vid = ids[0]
     last_err = None
     for inst in INVIDIOUS_INSTANCES:
         try:
-            v = http_get_json(inst + '/api/v1/videos/' + vid, timeout=8)
+            v = http_get_json(inst + '/api/v1/videos/' + vid, timeout=10)
             fmts = v.get('adaptiveFormats') or []
             audio_fmts = [f for f in fmts if 'audio' in (f.get('type') or '')]
             if not audio_fmts:
@@ -354,7 +275,106 @@ def fetch_via_invidious(query):
         except Exception as e:
             last_err = e
             log.warning('invidious %s: %s', inst, e)
-    raise RuntimeError('invidious all instances failed: ' + str(last_err))
+    raise RuntimeError('invidious all failed: ' + str(last_err))
+
+
+def fetch_via_pytubefix(query):
+    """
+    pytubefix — alternative YouTube extractor, sometimes bypasses bot detection
+    via different internal mechanisms than yt-dlp.
+    """
+    try:
+        from pytubefix import YouTube, Search
+    except ImportError:
+        raise RuntimeError('pytubefix not installed')
+
+    q = query.strip()
+    if re.match(r'https?://', q) and re.search(r'(youtube\.com|youtu\.be)', q):
+        yt = YouTube(q, use_oauth=False, allow_oauth_cache=False)
+    else:
+        results = Search(q).videos
+        if not results:
+            raise RuntimeError('no results from pytubefix search')
+        yt = results[0]
+
+    audio = yt.streams.filter(only_audio=True).order_by('abr').last()
+    if not audio:
+        raise RuntimeError('no audio stream from pytubefix')
+
+    log.info('pytubefix ok: %s', yt.title)
+    return {
+        'url': audio.url,
+        'title': yt.title,
+        'duration': yt.length or 0,
+        'thumbnail': yt.thumbnail_url,
+        'webpage_url': yt.watch_url,
+        'uploader': yt.author,
+        'query': query,
+    }
+
+
+def fetch_via_ytdlp_cookies(query):
+    """yt-dlp with cookies — last resort if cookies secret is set."""
+    if not os.path.exists(COOKIES_FILE):
+        raise RuntimeError('no cookies file, skipping ytdlp')
+    q = query.strip()
+    opts = {
+        'format': 'bestaudio[ext=m4a]/bestaudio/best',
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': True,
+        'source_address': '0.0.0.0',
+        'cookiefile': COOKIES_FILE,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120',
+        },
+    }
+    if re.match(r'https?://', q):
+        target = q
+    else:
+        ids = youtube_html_search(q, n=1)
+        if not ids:
+            raise RuntimeError('no results')
+        target = 'https://www.youtube.com/watch?v=' + ids[0]
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        data = ydl.extract_info(target, download=False)
+    if 'entries' in data:
+        data = data['entries'][0]
+    if not data.get('url'):
+        raise RuntimeError('no stream url')
+    log.info('ytdlp+cookies ok: %s', data.get('title'))
+    return {
+        'url': data['url'],
+        'title': data.get('title', 'Unknown'),
+        'duration': data.get('duration', 0),
+        'thumbnail': data.get('thumbnail'),
+        'webpage_url': data.get('webpage_url', target),
+        'uploader': data.get('uploader', 'Unknown'),
+        'query': query,
+    }
+
+
+def fetch_spotify_info(url):
+    req = urllib.request.Request(url, headers={
+        'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1)',
+        'Accept-Language': 'en-US,en;q=0.9',
+    })
+    with urllib.request.urlopen(req, timeout=10) as r:
+        html = r.read().decode('utf-8', 'ignore')
+    title = re.search(r'<meta[^>]+property="og:title"[^>]+content="([^"]+)"', html)
+    desc = re.search(r'<meta[^>]+property="og:description"[^>]+content="([^"]+)"', html)
+    thumb = re.search(r'<meta[^>]+property="og:image"[^>]+content="([^"]+)"', html)
+    og_title = title.group(1) if title else None
+    og_desc = desc.group(1) if desc else ''
+    og_thumb = thumb.group(1) if thumb else None
+    if not og_title:
+        raise RuntimeError('could not scrape Spotify info')
+    artist = ''
+    if og_desc:
+        parts = [p.strip() for p in og_desc.split('·')]
+        if len(parts) >= 2:
+            artist = parts[1]
+    return (og_title + ' ' + artist).strip(), og_title, og_thumb
 
 
 def _detect_url_type(q):
@@ -378,7 +398,10 @@ async def fetch_track(query):
         errors = []
 
         if url_type == 'soundcloud':
-            for fn, name in [(fetch_via_soundcloud, 'soundcloud'), (fetch_via_ytdlp, 'ytdlp')]:
+            for fn, name in [
+                (fetch_via_soundcloud, 'soundcloud'),
+                (fetch_via_ytdlp_cookies, 'ytdlp+cookies'),
+            ]:
                 try:
                     return fn(q)
                 except Exception as e:
@@ -388,8 +411,13 @@ async def fetch_track(query):
         if url_type == 'spotify':
             try:
                 search_q, sp_title, sp_thumb = fetch_spotify_info(q)
-                log.info('spotify → youtube search: %s', search_q)
-                for fn, name in [(fetch_via_ytdlp, 'ytdlp'), (fetch_via_piped, 'piped')]:
+                log.info('spotify → %s', search_q)
+                for fn, name in [
+                    (fetch_via_piped, 'piped'),
+                    (fetch_via_pytubefix, 'pytubefix'),
+                    (fetch_via_invidious, 'invidious'),
+                    (fetch_via_ytdlp_cookies, 'ytdlp+cookies'),
+                ]:
                     try:
                         result = fn(search_q)
                         if not result.get('thumbnail') and sp_thumb:
@@ -400,20 +428,31 @@ async def fetch_track(query):
                     except Exception as e:
                         errors.append(name + ': ' + str(e))
             except Exception as e:
-                errors.append('spotify: ' + str(e))
+                errors.append('spotify_scrape: ' + str(e))
             raise RuntimeError(' | '.join(errors))
 
         if url_type in ('youtube', 'other_url'):
-            # Direct URL — yt-dlp first (tv_embedded), then Piped
-            for fn, name in [(fetch_via_ytdlp, 'ytdlp'), (fetch_via_piped, 'piped'), (fetch_via_invidious, 'invidious')]:
+            # Piped first — its servers proxy to YouTube, bypassing GitHub Actions IP block
+            for fn, name in [
+                (fetch_via_piped, 'piped'),
+                (fetch_via_pytubefix, 'pytubefix'),
+                (fetch_via_invidious, 'invidious'),
+                (fetch_via_ytdlp_cookies, 'ytdlp+cookies'),
+            ]:
                 try:
                     return fn(q)
                 except Exception as e:
                     errors.append(name + ': ' + str(e))
             raise RuntimeError(' | '.join(errors))
 
-        # Search query — yt-dlp first, Piped second, SoundCloud third
-        for fn, name in [(fetch_via_ytdlp, 'ytdlp'), (fetch_via_piped, 'piped'), (fetch_via_soundcloud, 'soundcloud')]:
+        # Search query: SoundCloud first (always works), then Piped for YouTube
+        for fn, name in [
+            (fetch_via_soundcloud, 'soundcloud'),
+            (fetch_via_piped, 'piped'),
+            (fetch_via_pytubefix, 'pytubefix'),
+            (fetch_via_invidious, 'invidious'),
+            (fetch_via_ytdlp_cookies, 'ytdlp+cookies'),
+        ]:
             try:
                 return fn(q)
             except Exception as e:
@@ -432,11 +471,7 @@ queues = {}
 now_playing = {}
 loop_mode = {}
 
-LOOP_LABELS = {
-    'off': 'ปิด',
-    'one': '🔂 1 เพลง',
-    'all': '🔁 ทั้งคิว',
-}
+LOOP_LABELS = {'off': 'ปิด', 'one': '🔂 1 เพลง', 'all': '🔁 ทั้งคิว'}
 
 
 def get_queue(guild_id):
@@ -466,9 +501,7 @@ def fmt_duration(seconds):
     s = int(seconds)
     h, rem = divmod(s, 3600)
     m, sec = divmod(rem, 60)
-    if h:
-        return str(h) + ':' + str(m).zfill(2) + ':' + str(sec).zfill(2)
-    return str(m) + ':' + str(sec).zfill(2)
+    return (str(h) + ':' if h else '') + str(m).zfill(2 if h else 1) + ':' + str(sec).zfill(2)
 
 
 def make_np_embed(track, guild_id=None):
@@ -496,65 +529,52 @@ class PlayerView(discord.ui.View):
         mode = get_loop(self.ctx.guild.id)
         for child in self.children:
             if getattr(child, 'custom_id', None) == 'loop':
-                if mode == 'off':
-                    child.label = 'Loop: Off'
-                    child.emoji = '🔁'
-                    child.style = discord.ButtonStyle.secondary
-                elif mode == 'one':
-                    child.label = 'Loop: 1 เพลง'
-                    child.emoji = '🔂'
-                    child.style = discord.ButtonStyle.success
-                else:
-                    child.label = 'Loop: ทั้งคิว'
-                    child.emoji = '🔁'
-                    child.style = discord.ButtonStyle.success
+                child.label = {'off': 'Loop: Off', 'one': 'Loop: 1 เพลง', 'all': 'Loop: ทั้งคิว'}[mode]
+                child.emoji = '🔂' if mode == 'one' else '🔁'
+                child.style = discord.ButtonStyle.secondary if mode == 'off' else discord.ButtonStyle.success
 
-    async def _ack(self, interaction):
+    async def _ack(self, i):
         try:
-            await interaction.response.defer()
+            await i.response.defer()
         except Exception:
             pass
 
     @discord.ui.button(emoji='⏯️', label='Pause/Resume', style=discord.ButtonStyle.primary, custom_id='pp')
-    async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._ack(interaction)
+    async def pause_resume(self, i: discord.Interaction, b):
+        await self._ack(i)
         vc = self.ctx.voice_client
         if not vc:
-            await interaction.followup.send('❌ บอทไม่ได้อยู่ใน voice', ephemeral=True)
-            return
+            await i.followup.send('❌ บอทไม่ได้อยู่ใน voice', ephemeral=True); return
         if vc.is_playing():
-            vc.pause()
-            await interaction.followup.send('⏸️ หยุดชั่วคราว', ephemeral=True)
+            vc.pause(); await i.followup.send('⏸️ หยุดชั่วคราว', ephemeral=True)
         elif vc.is_paused():
-            vc.resume()
-            await interaction.followup.send('▶️ เล่นต่อ', ephemeral=True)
+            vc.resume(); await i.followup.send('▶️ เล่นต่อ', ephemeral=True)
         else:
-            await interaction.followup.send('❌ ไม่มีเพลงเล่นอยู่', ephemeral=True)
+            await i.followup.send('❌ ไม่มีเพลงเล่นอยู่', ephemeral=True)
 
     @discord.ui.button(emoji='⏭️', label='Skip', style=discord.ButtonStyle.primary, custom_id='skip')
-    async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._ack(interaction)
+    async def skip_btn(self, i: discord.Interaction, b):
+        await self._ack(i)
         vc = self.ctx.voice_client
         if vc and (vc.is_playing() or vc.is_paused()):
-            vc.stop()
-            await interaction.followup.send('⏭️ ข้ามเพลง', ephemeral=True)
+            vc.stop(); await i.followup.send('⏭️ ข้ามเพลง', ephemeral=True)
         else:
-            await interaction.followup.send('❌ ไม่มีเพลงเล่นอยู่', ephemeral=True)
+            await i.followup.send('❌ ไม่มีเพลงเล่นอยู่', ephemeral=True)
 
     @discord.ui.button(emoji='🔁', label='Loop: Off', style=discord.ButtonStyle.secondary, custom_id='loop')
-    async def loop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._ack(interaction)
+    async def loop_btn(self, i: discord.Interaction, b):
+        await self._ack(i)
         mode = cycle_loop(self.ctx.guild.id)
         self._refresh_loop_button()
         try:
-            await interaction.message.edit(view=self)
+            await i.message.edit(view=self)
         except Exception:
             pass
-        await interaction.followup.send('🔁 เปลี่ยนโหมด Loop เป็น: **' + LOOP_LABELS[mode] + '**', ephemeral=True)
+        await i.followup.send('🔁 Loop: **' + LOOP_LABELS[mode] + '**', ephemeral=True)
 
     @discord.ui.button(emoji='⏹️', label='Stop', style=discord.ButtonStyle.danger, custom_id='stop')
-    async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._ack(interaction)
+    async def stop_btn(self, i: discord.Interaction, b):
+        await self._ack(i)
         vc = self.ctx.voice_client
         if vc:
             queues[self.ctx.guild.id] = []
@@ -565,9 +585,9 @@ class PlayerView(discord.ui.View):
                 await vc.disconnect(force=True)
             except Exception:
                 pass
-            await interaction.followup.send('⏹️ หยุดและออกจาก voice แล้ว', ephemeral=True)
+            await i.followup.send('⏹️ หยุดและออกจาก voice', ephemeral=True)
         else:
-            await interaction.followup.send('❌ บอทไม่ได้อยู่ใน voice', ephemeral=True)
+            await i.followup.send('❌ บอทไม่ได้อยู่ใน voice', ephemeral=True)
 
 
 async def ensure_voice(ctx):
@@ -580,10 +600,9 @@ async def ensure_voice(ctx):
                     await vc.move_to(target)
                 return vc
             vc = await target.connect(timeout=30.0, reconnect=True, self_deaf=True)
-            log.info('voice connected (attempt %d)', attempt)
             return vc
         except (asyncio.TimeoutError, discord.errors.ConnectionClosed, discord.ClientException) as e:
-            log.warning('voice connect attempt %d failed: %s', attempt, e)
+            log.warning('voice attempt %d: %s', attempt, e)
             try:
                 if ctx.voice_client:
                     await ctx.voice_client.disconnect(force=True)
@@ -591,24 +610,18 @@ async def ensure_voice(ctx):
                 pass
             vc = None
             await asyncio.sleep(2 * attempt)
-    raise RuntimeError('voice connect failed after 4 attempts')
+    raise RuntimeError('voice connect failed')
 
 
 async def _start_playback(ctx, track):
     vc = ctx.voice_client
     if not vc or not vc.is_connected():
-        log.warning('no voice client when starting playback')
         return False
-    source = discord.FFmpegPCMAudio(
-        track['url'],
-        before_options=FFMPEG_BEFORE,
-        options=FFMPEG_OPTIONS,
-    )
-    vc.play(
-        source,
-        after=lambda err: (log.warning('after-play err: %s', err) if err else None,
-                            asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)),
-    )
+    source = discord.FFmpegPCMAudio(track['url'], before_options=FFMPEG_BEFORE, options=FFMPEG_OPTIONS)
+    vc.play(source, after=lambda err: (
+        log.warning('after-play: %s', err) if err else None,
+        asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop),
+    ))
     return True
 
 
@@ -636,7 +649,7 @@ async def play_next(ctx):
             fresh = await fetch_track(next_track['query'])
             next_track['url'] = fresh['url']
         except Exception as e:
-            log.warning('re-fetch for loop failed: %s', e)
+            log.warning('re-fetch failed: %s', e)
 
     try:
         ok = await _start_playback(ctx, next_track)
@@ -644,9 +657,9 @@ async def play_next(ctx):
             return
         await ctx.send(embed=make_np_embed(next_track, guild_id), view=PlayerView(ctx))
     except Exception as e:
-        log.exception('play_next error')
+        log.exception('play_next error: %s', e)
         try:
-            await ctx.send('⚠️ เล่นไม่ได้: ' + str(e) + '\nข้ามเพลงถัดไป...')
+            await ctx.send('⚠️ เล่นไม่ได้ ข้ามเพลงถัดไป...')
         except Exception:
             pass
         asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
@@ -655,16 +668,13 @@ async def play_next(ctx):
 @bot.event
 async def on_ready():
     log.info('%s online (id=%s)', bot.user, bot.user.id)
-    await bot.change_presence(
-        activity=discord.Activity(type=discord.ActivityType.listening, name='!play')
-    )
+    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name='!play'))
 
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    if member.id != bot.user.id:
-        return
-    log.info('voice state: before.channel=%s after.channel=%s', before.channel, after.channel)
+    if member.id == bot.user.id:
+        log.info('voice: %s → %s', before.channel, after.channel)
 
 
 @bot.event
@@ -688,15 +698,9 @@ async def play(ctx, *, query):
         return
 
     url_type = _detect_url_type(query.strip())
-    type_labels = {
-        'youtube': '▶️ YouTube',
-        'soundcloud': '🔶 SoundCloud',
-        'spotify': '🟢 Spotify',
-        'other_url': '🔗 Link',
-        'search': '🔍 ค้นหา',
-    }
-    status_label = type_labels.get(url_type, '🔍 ค้นหา')
-    status = await ctx.send(status_label + ': `' + query[:80] + '` ...')
+    labels = {'youtube': '▶️ YouTube', 'soundcloud': '🔶 SoundCloud',
+              'spotify': '🟢 Spotify', 'other_url': '🔗 Link', 'search': '🔍 ค้นหา'}
+    status = await ctx.send(labels.get(url_type, '🔍') + ': `' + query[:80] + '` ...')
 
     try:
         vc = await ensure_voice(ctx)
@@ -711,7 +715,6 @@ async def play(ctx, *, query):
         return
 
     queue = get_queue(ctx.guild.id)
-
     if vc.is_playing() or vc.is_paused():
         queue.append(track)
         embed = discord.Embed(
@@ -719,8 +722,8 @@ async def play(ctx, *, query):
             description='**[' + track['title'] + '](' + track['webpage_url'] + ')**',
             color=0x57F287,
         )
-        embed.add_field(name='ลำดับในคิว', value=str(len(queue)), inline=True)
-        embed.add_field(name='⏱ ความยาว', value=fmt_duration(track['duration']), inline=True)
+        embed.add_field(name='ลำดับ', value=str(len(queue)), inline=True)
+        embed.add_field(name='⏱', value=fmt_duration(track['duration']), inline=True)
         if track.get('thumbnail'):
             embed.set_thumbnail(url=track['thumbnail'])
         await status.edit(content=None, embed=embed)
@@ -729,11 +732,10 @@ async def play(ctx, *, query):
         try:
             ok = await _start_playback(ctx, track)
             if not ok:
-                await status.edit(content='❌ เริ่มเล่นไม่ได้ (voice ไม่พร้อม)')
+                await status.edit(content='❌ เริ่มเล่นไม่ได้')
                 return
             await status.edit(content=None, embed=make_np_embed(track, ctx.guild.id), view=PlayerView(ctx))
         except Exception as e:
-            log.exception('play start error')
             await status.edit(content='❌ เริ่มเล่นไม่ได้: ' + str(e))
 
 
@@ -753,17 +755,12 @@ async def show_queue(ctx):
     embed = discord.Embed(title='📋 คิวเพลง', color=0x5865F2)
     embed.add_field(name='🔁 Loop', value=LOOP_LABELS[get_loop(ctx.guild.id)], inline=False)
     if np:
-        embed.add_field(name='🎵 กำลังเล่น',
-            value='**' + np['title'] + '**  ' + fmt_duration(np['duration']),
-            inline=False)
+        embed.add_field(name='🎵 กำลังเล่น', value='**' + np['title'] + '**  ' + fmt_duration(np['duration']), inline=False)
     if queue:
-        lines = []
-        for i, t in enumerate(queue[:10], 1):
-            lines.append(str(i) + '. **' + t['title'] + '**  ' + fmt_duration(t['duration']))
+        lines = [str(i) + '. **' + t['title'] + '**  ' + fmt_duration(t['duration']) for i, t in enumerate(queue[:10], 1)]
         if len(queue) > 10:
-            lines.append('...และอีก ' + str(len(queue) - 10) + ' เพลง')
-        embed.add_field(name='รอในคิว (' + str(len(queue)) + ' เพลง)',
-                        value='\n'.join(lines), inline=False)
+            lines.append('...อีก ' + str(len(queue) - 10) + ' เพลง')
+        embed.add_field(name='คิว (' + str(len(queue)) + ')', value='\n'.join(lines), inline=False)
     elif not np:
         embed.description = 'คิวว่างเปล่า'
     await ctx.send(embed=embed)
@@ -799,22 +796,18 @@ async def resume(ctx):
 @bot.command(name='loop', aliases=['l'])
 async def loop_cmd(ctx, mode: str = None):
     valid = {'off', 'one', 'all'}
-    aliases_map = {
-        'no': 'off', 'none': 'off', '0': 'off',
-        '1': 'one', 'single': 'one', 'song': 'one', 'track': 'one',
-        'queue': 'all', 'q': 'all', 'a': 'all',
-    }
+    aliases_map = {'no': 'off', 'none': 'off', '0': 'off', '1': 'one',
+                   'single': 'one', 'song': 'one', 'queue': 'all', 'q': 'all', 'a': 'all'}
     if mode is None:
         new_mode = cycle_loop(ctx.guild.id)
     else:
-        m = mode.lower()
-        m = aliases_map.get(m, m)
+        m = aliases_map.get(mode.lower(), mode.lower())
         if m not in valid:
             await ctx.send('❌ ใช้: `!loop off | one | all`')
             return
         set_loop(ctx.guild.id, m)
         new_mode = m
-    await ctx.send('🔁 โหมด Loop: **' + LOOP_LABELS[new_mode] + '**')
+    await ctx.send('🔁 Loop: **' + LOOP_LABELS[new_mode] + '**')
 
 
 @bot.command(name='clear', aliases=['cl'])
@@ -830,9 +823,9 @@ async def leave(ctx):
         now_playing.pop(ctx.guild.id, None)
         set_loop(ctx.guild.id, 'off')
         await ctx.voice_client.disconnect(force=True)
-        await ctx.send('👋 ออกจาก voice channel แล้ว')
+        await ctx.send('👋 ออกจาก voice แล้ว')
     else:
-        await ctx.send('❌ บอทไม่ได้อยู่ใน voice channel')
+        await ctx.send('❌ บอทไม่ได้อยู่ใน voice')
 
 
 @bot.command(name='stop')
@@ -843,9 +836,9 @@ async def stop(ctx):
         set_loop(ctx.guild.id, 'off')
         ctx.voice_client.stop()
         await ctx.voice_client.disconnect(force=True)
-        await ctx.send('⏹️ หยุดและออกจาก voice channel แล้ว')
+        await ctx.send('⏹️ หยุดและออกจาก voice แล้ว')
     else:
-        await ctx.send('❌ บอทไม่ได้อยู่ใน voice channel')
+        await ctx.send('❌ บอทไม่ได้อยู่ใน voice')
 
 
 @bot.command(name='reconnect', aliases=['rc'])
@@ -856,11 +849,11 @@ async def reconnect(ctx):
         except Exception:
             pass
     if not ctx.author.voice:
-        await ctx.send('❌ เข้า voice channel ก่อน แล้วใช้ `!rc`')
+        await ctx.send('❌ เข้า voice channel ก่อน')
         return
     try:
         await ensure_voice(ctx)
-        await ctx.send('🔄 เชื่อมต่อ voice ใหม่แล้ว')
+        await ctx.send('🔄 เชื่อมต่อใหม่แล้ว')
     except Exception as e:
         await ctx.send('❌ เชื่อมต่อไม่ได้: ' + str(e))
 
@@ -870,28 +863,20 @@ async def help_cmd(ctx):
     embed = discord.Embed(title='🎵 คำสั่งทั้งหมด', color=0x5865F2)
     embed.add_field(
         name='!play <ชื่อเพลง หรือ link>',
-        value=(
-            'เล่นเพลง / เพิ่มเข้าคิว\n'
-            'รองรับ: 🔍 ค้นหา · ▶️ YouTube · 🟢 Spotify · 🔶 SoundCloud · 🔗 link อื่นๆ\n'
-            '```\n'
-            '!play จี๋หอย\n'
-            '!play https://youtu.be/dQw4w9WgXcQ\n'
-            '!play https://open.spotify.com/track/...\n'
-            '!play https://soundcloud.com/...\n'
-            '```'
-        ),
+        value='รองรับ: 🔍 ค้นหา · ▶️ YouTube · 🟢 Spotify · 🔶 SoundCloud\n'
+              '```!play จี๋หอย\n!play https://youtu.be/...\n!play https://open.spotify.com/track/...\n!play https://soundcloud.com/...```',
         inline=False,
     )
-    embed.add_field(name='!skip  (!s)', value='ข้ามเพลง', inline=False)
-    embed.add_field(name='!queue  (!q)', value='ดูคิวเพลง', inline=False)
-    embed.add_field(name='!np', value='ดูเพลงที่เล่นอยู่ + ปุ่มควบคุม', inline=False)
-    embed.add_field(name='!loop [off|one|all]', value='ตั้งโหมด Loop', inline=False)
-    embed.add_field(name='!pause / !resume', value='หยุดชั่วคราว / เล่นต่อ', inline=False)
-    embed.add_field(name='!reconnect (!rc)', value='เชื่อมต่อ voice ใหม่ถ้าหลุด', inline=False)
-    embed.add_field(name='!clear', value='ล้างคิว', inline=False)
-    embed.add_field(name='!leave  (!dc)', value='ออกจาก voice channel', inline=False)
-    embed.add_field(name='!stop', value='หยุดเพลง + ออก voice channel', inline=False)
-    embed.set_footer(text='ปุ่มใต้ Now Playing: ⏯️ Pause/Resume  ⏭️ Skip  🔁 Loop  ⏹️ Stop')
+    embed.add_field(name='!skip (!s)', value='ข้ามเพลง', inline=True)
+    embed.add_field(name='!queue (!q)', value='ดูคิว', inline=True)
+    embed.add_field(name='!np', value='Now Playing + ปุ่ม', inline=True)
+    embed.add_field(name='!loop [off|one|all]', value='โหมด Loop', inline=True)
+    embed.add_field(name='!pause / !resume', value='หยุด / เล่นต่อ', inline=True)
+    embed.add_field(name='!stop', value='หยุด + ออก voice', inline=True)
+    embed.add_field(name='!clear', value='ล้างคิว', inline=True)
+    embed.add_field(name='!leave (!dc)', value='ออก voice', inline=True)
+    embed.add_field(name='!reconnect (!rc)', value='เชื่อมใหม่', inline=True)
+    embed.set_footer(text='ปุ่ม Now Playing: ⏯️ Pause/Resume  ⏭️ Skip  🔁 Loop  ⏹️ Stop')
     await ctx.send(embed=embed)
 
 
