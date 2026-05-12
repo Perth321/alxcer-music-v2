@@ -11,6 +11,7 @@ import urllib.error
 import ssl
 import json
 import logging
+import shutil
 import sys
 
 logging.basicConfig(
@@ -20,13 +21,28 @@ logging.basicConfig(
 )
 log = logging.getLogger('alxcer')
 
-try:
-    import imageio_ffmpeg
-    FFMPEG_EXECUTABLE = imageio_ffmpeg.get_ffmpeg_exe()
-    log.info('ffmpeg bundled binary: %s', FFMPEG_EXECUTABLE)
-except Exception as e:
-    FFMPEG_EXECUTABLE = 'ffmpeg'
-    log.warning('using system ffmpeg: %s', e)
+def resolve_ffmpeg_executable():
+    override = os.environ.get('FFMPEG_EXECUTABLE')
+    if override:
+        log.info('ffmpeg override: %s', override)
+        return override
+
+    system_ffmpeg = shutil.which('ffmpeg')
+    if system_ffmpeg:
+        log.info('ffmpeg system binary: %s', system_ffmpeg)
+        return system_ffmpeg
+
+    try:
+        import imageio_ffmpeg
+        bundled_ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        log.info('ffmpeg bundled binary: %s', bundled_ffmpeg)
+        return bundled_ffmpeg
+    except Exception as e:
+        log.warning('ffmpeg resolution fallback: %s', e)
+        return 'ffmpeg'
+
+
+FFMPEG_EXECUTABLE = resolve_ffmpeg_executable()
 
 if not discord.opus.is_loaded():
     for name in ('libopus.so.0', 'libopus.so', 'opus'):
@@ -798,10 +814,20 @@ async def _start_playback(ctx, track):
         codec=codec,
         bitrate=128,
     )
-    vc.play(source, after=lambda err: (
-        log.warning('after-play: %s', err) if err else None,
-        asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop),
-    ))
+
+    def after_play(err):
+        if err:
+            log.warning('after-play: %s', err)
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    ctx.send('Audio stopped with error: `' + str(err)[:180] + '`'),
+                    bot.loop,
+                )
+            except Exception:
+                pass
+        asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
+
+    vc.play(source, after=after_play)
     return True
 
 
@@ -1037,6 +1063,60 @@ async def reconnect(ctx):
         await ctx.send('🔄 เชื่อมต่อใหม่แล้ว')
     except Exception as e:
         await ctx.send('❌ เชื่อมต่อไม่ได้: ' + str(e))
+
+
+@bot.command(name='testaudio', aliases=['beep', 'tone'])
+async def testaudio(ctx, seconds: int = 8):
+    if not ctx.author.voice:
+        await ctx.send('Join a voice channel first.')
+        return
+    seconds = max(2, min(seconds, 20))
+    try:
+        vc = await ensure_voice(ctx)
+    except Exception as e:
+        await ctx.send('Voice connect failed: ' + str(e))
+        return
+
+    if vc.is_playing() or vc.is_paused():
+        vc.stop()
+
+    source = discord.FFmpegOpusAudio(
+        'sine=frequency=880:duration=' + str(seconds),
+        executable=FFMPEG_EXECUTABLE,
+        before_options='-f lavfi',
+        options=FFMPEG_TRANSCODE_OPTIONS,
+        codec='opus',
+        bitrate=128,
+    )
+
+    def after_test(err):
+        if err:
+            log.warning('testaudio after-play: %s', err)
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    ctx.send('Test audio error: `' + str(err)[:180] + '`'),
+                    bot.loop,
+                )
+            except Exception:
+                pass
+
+    vc.play(source, after=after_test)
+    await ctx.send('Playing test tone for ' + str(seconds) + ' seconds.')
+
+
+@bot.command(name='diag')
+async def diag(ctx):
+    vc = ctx.voice_client
+    if not vc:
+        voice = 'not connected'
+    else:
+        voice = (
+            'connected=' + str(vc.is_connected())
+            + ' playing=' + str(vc.is_playing())
+            + ' paused=' + str(vc.is_paused())
+            + ' channel=' + str(vc.channel)
+        )
+    await ctx.send('ffmpeg=`' + FFMPEG_EXECUTABLE + '`\nvoice: `' + voice + '`')
 
 
 @bot.command(name='help', aliases=['h', 'commands'])
