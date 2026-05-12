@@ -79,9 +79,81 @@ def http_get_json(url, timeout=8):
         return json.loads(r.read().decode('utf-8', 'ignore'))
 
 
+YOUTUBE_VIDEO_ID_RE = re.compile(r'^[A-Za-z0-9_-]{11}$')
+
+
+def clean_query(query):
+    q = (query or '').strip()
+    if q.startswith('<') and q.endswith('>'):
+        q = q[1:-1].strip()
+    return q
+
+
+def _is_video_id(value):
+    return bool(value and YOUTUBE_VIDEO_ID_RE.match(value))
+
+
+def _is_youtube_host(host):
+    host = (host or '').lower().split(':', 1)[0]
+    return (
+        host == 'youtu.be'
+        or host.endswith('.youtube.com')
+        or host == 'youtube.com'
+        or host.endswith('.youtube-nocookie.com')
+        or host == 'youtube-nocookie.com'
+    )
+
+
+def is_youtube_url(value):
+    try:
+        parsed = urllib.parse.urlparse(clean_query(value))
+    except Exception:
+        return False
+    return parsed.scheme in ('http', 'https') and _is_youtube_host(parsed.netloc)
+
+
 def extract_video_id(s):
-    m = re.search(r'(?:v=|youtu\.be/|/shorts/|/embed/)([A-Za-z0-9_-]{11})', s)
+    q = clean_query(s)
+    try:
+        parsed = urllib.parse.urlparse(q)
+        host = parsed.netloc.lower().split(':', 1)[0]
+        path_parts = [p for p in parsed.path.split('/') if p]
+
+        if host == 'youtu.be' and path_parts and _is_video_id(path_parts[0]):
+            return path_parts[0]
+
+        if _is_youtube_host(host):
+            params = urllib.parse.parse_qs(parsed.query)
+            for key in ('v', 'vi'):
+                for value in params.get(key, []):
+                    if _is_video_id(value):
+                        return value
+
+            if parsed.path == '/attribution_link':
+                for value in params.get('u', []):
+                    nested = urllib.parse.unquote(value)
+                    nested_id = extract_video_id(nested)
+                    if nested_id:
+                        return nested_id
+
+            if path_parts:
+                if path_parts[0] in ('shorts', 'embed', 'live', 'v', 'e') and len(path_parts) > 1:
+                    if _is_video_id(path_parts[1]):
+                        return path_parts[1]
+                if _is_video_id(path_parts[0]):
+                    return path_parts[0]
+    except Exception:
+        pass
+
+    m = re.search(r'(?:v=|vi=|youtu\.be/|/shorts/|/embed/|/live/|/v/|/e/)([A-Za-z0-9_-]{11})', q)
     return m.group(1) if m else None
+
+
+def canonical_youtube_url(query):
+    vid = extract_video_id(query)
+    if not vid:
+        raise RuntimeError('no YouTube video ID found in URL')
+    return 'https://www.youtube.com/watch?v=' + vid
 
 
 _SC_CLIENT_ID = None
@@ -165,6 +237,7 @@ def fetch_via_soundcloud(query):
 
 
 def youtube_html_search(query, n=5):
+    query = clean_query(query)
     url = 'https://www.youtube.com/results?search_query=' + urllib.parse.quote(query)
     req = urllib.request.Request(url, headers={
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
@@ -189,6 +262,7 @@ def fetch_via_piped(query):
     Piped API — Piped's own servers fetch from YouTube, so GitHub Actions IP
     is never seen by YouTube. This is the primary YouTube source.
     """
+    query = clean_query(query)
     vid = extract_video_id(query)
     if not vid:
         # Search YouTube HTML to find video ID, then use Piped for stream
@@ -205,9 +279,9 @@ def fetch_via_piped(query):
                         timeout=8,
                     )
                     items = results.get('items') or []
-                    vids = [i.get('url', '').split('=')[-1] for i in items if i.get('type') == 'stream']
+                    vids = [extract_video_id(i.get('url', '')) for i in items if i.get('type') == 'stream']
                     if vids:
-                        ids = [v for v in vids if len(v) == 11]
+                        ids = [v for v in vids if v]
                         break
                 except Exception as e:
                     log.debug('piped search %s: %s', inst, e)
@@ -243,6 +317,7 @@ def fetch_via_piped(query):
 
 
 def fetch_via_invidious(query):
+    query = clean_query(query)
     vid = extract_video_id(query)
     if not vid:
         try:
@@ -288,9 +363,9 @@ def fetch_via_pytubefix(query):
     except ImportError:
         raise RuntimeError('pytubefix not installed')
 
-    q = query.strip()
-    if re.match(r'https?://', q) and re.search(r'(youtube\.com|youtu\.be)', q):
-        yt = YouTube(q, use_oauth=False, allow_oauth_cache=False)
+    q = clean_query(query)
+    if is_youtube_url(q):
+        yt = YouTube(canonical_youtube_url(q), use_oauth=False, allow_oauth_cache=False)
     else:
         results = Search(q).videos
         if not results:
@@ -313,36 +388,46 @@ def fetch_via_pytubefix(query):
     }
 
 
-def fetch_via_ytdlp_cookies(query):
-    """yt-dlp with cookies — last resort if cookies secret is set."""
-    if not os.path.exists(COOKIES_FILE):
-        raise RuntimeError('no cookies file, skipping ytdlp')
-    q = query.strip()
+def ytdlp_target(query):
+    q = clean_query(query)
+    if is_youtube_url(q):
+        return canonical_youtube_url(q)
+    if re.match(r'https?://', q):
+        return q
+    ids = youtube_html_search(q, n=1)
+    if not ids:
+        raise RuntimeError('no results')
+    return 'https://www.youtube.com/watch?v=' + ids[0]
+
+
+def fetch_via_ytdlp(query, cookiefile=None, label='yt-dlp'):
+    """yt-dlp fallback for direct URLs and YouTube searches."""
     opts = {
         'format': 'bestaudio[ext=m4a]/bestaudio/best',
         'quiet': True,
         'no_warnings': True,
         'noplaylist': True,
         'source_address': '0.0.0.0',
-        'cookiefile': COOKIES_FILE,
+        'geo_bypass': True,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'web'],
+            },
+        },
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120',
         },
     }
-    if re.match(r'https?://', q):
-        target = q
-    else:
-        ids = youtube_html_search(q, n=1)
-        if not ids:
-            raise RuntimeError('no results')
-        target = 'https://www.youtube.com/watch?v=' + ids[0]
+    if cookiefile:
+        opts['cookiefile'] = cookiefile
+    target = ytdlp_target(query)
     with yt_dlp.YoutubeDL(opts) as ydl:
         data = ydl.extract_info(target, download=False)
     if 'entries' in data:
         data = data['entries'][0]
     if not data.get('url'):
         raise RuntimeError('no stream url')
-    log.info('ytdlp+cookies ok: %s', data.get('title'))
+    log.info('%s ok: %s', label, data.get('title'))
     return {
         'url': data['url'],
         'title': data.get('title', 'Unknown'),
@@ -352,6 +437,17 @@ def fetch_via_ytdlp_cookies(query):
         'uploader': data.get('uploader', 'Unknown'),
         'query': query,
     }
+
+
+def fetch_via_ytdlp_direct(query):
+    return fetch_via_ytdlp(query, label='yt-dlp')
+
+
+def fetch_via_ytdlp_cookies(query):
+    """yt-dlp with cookies - last resort if cookies secret is set."""
+    if not os.path.exists(COOKIES_FILE):
+        raise RuntimeError('no cookies file, skipping ytdlp')
+    return fetch_via_ytdlp(query, cookiefile=COOKIES_FILE, label='ytdlp+cookies')
 
 
 def fetch_spotify_info(url):
@@ -378,9 +474,10 @@ def fetch_spotify_info(url):
 
 
 def _detect_url_type(q):
+    q = clean_query(q)
     if not re.match(r'https?://', q):
         return 'search'
-    if re.search(r'(youtube\.com|youtu\.be)', q):
+    if is_youtube_url(q):
         return 'youtube'
     if 'soundcloud.com' in q:
         return 'soundcloud'
@@ -393,13 +490,14 @@ async def fetch_track(query):
     loop = asyncio.get_event_loop()
 
     def _run():
-        q = query.strip()
+        q = clean_query(query)
         url_type = _detect_url_type(q)
         errors = []
 
         if url_type == 'soundcloud':
             for fn, name in [
                 (fetch_via_soundcloud, 'soundcloud'),
+                (fetch_via_ytdlp_direct, 'yt-dlp'),
                 (fetch_via_ytdlp_cookies, 'ytdlp+cookies'),
             ]:
                 try:
@@ -417,6 +515,7 @@ async def fetch_track(query):
                     (fetch_via_pytubefix, 'pytubefix'),
                     (fetch_via_invidious, 'invidious'),
                     (fetch_via_ytdlp_cookies, 'ytdlp+cookies'),
+                    (fetch_via_ytdlp_direct, 'yt-dlp'),
                 ]:
                     try:
                         result = fn(search_q)
@@ -431,12 +530,24 @@ async def fetch_track(query):
                 errors.append('spotify_scrape: ' + str(e))
             raise RuntimeError(' | '.join(errors))
 
-        if url_type in ('youtube', 'other_url'):
+        if url_type == 'youtube':
             # Piped first — its servers proxy to YouTube, bypassing GitHub Actions IP block
             for fn, name in [
                 (fetch_via_piped, 'piped'),
                 (fetch_via_pytubefix, 'pytubefix'),
                 (fetch_via_invidious, 'invidious'),
+                (fetch_via_ytdlp_cookies, 'ytdlp+cookies'),
+                (fetch_via_ytdlp_direct, 'yt-dlp'),
+            ]:
+                try:
+                    return fn(q)
+                except Exception as e:
+                    errors.append(name + ': ' + str(e))
+            raise RuntimeError(' | '.join(errors))
+
+        if url_type == 'other_url':
+            for fn, name in [
+                (fetch_via_ytdlp_direct, 'yt-dlp'),
                 (fetch_via_ytdlp_cookies, 'ytdlp+cookies'),
             ]:
                 try:
@@ -452,6 +563,7 @@ async def fetch_track(query):
             (fetch_via_pytubefix, 'pytubefix'),
             (fetch_via_invidious, 'invidious'),
             (fetch_via_ytdlp_cookies, 'ytdlp+cookies'),
+            (fetch_via_ytdlp_direct, 'yt-dlp'),
         ]:
             try:
                 return fn(q)
