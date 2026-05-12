@@ -7,6 +7,8 @@ import re
 import base64
 import urllib.request
 import urllib.parse
+import urllib.error
+import ssl
 import json
 import logging
 import sys
@@ -54,7 +56,10 @@ if _cookies_env and not os.path.exists(COOKIES_FILE):
         log.warning('failed to write cookies: %s', _e)
 
 # Piped instances — primary YouTube source (their servers extract, not GitHub Actions IP)
+HTTP_INSECURE_CONTEXT = ssl._create_unverified_context()
+
 PIPED_INSTANCES = [
+    'https://api.piped.private.coffee',
     'https://api.piped.projectsegfau.lt',
     'https://pipedapi.tokhmi.xyz',
     'https://pipedapi.kavin.rocks',
@@ -68,6 +73,10 @@ PIPED_INSTANCES = [
 ]
 
 # Invidious — last resort
+PIPED_INSTANCES_URL = 'https://piped-instances.kavin.rocks/'
+_PIPED_INSTANCES_CACHE = None
+_PIPED_INSTANCES_TS = 0
+
 INVIDIOUS_INSTANCES = [
     'https://invidious.privacyredirect.com',
     'https://invidious.nerdvpn.de',
@@ -78,13 +87,49 @@ INVIDIOUS_INSTANCES = [
 ]
 
 
-def http_get_json(url, timeout=8):
+def http_get_json(url, timeout=8, allow_insecure_retry=False):
     req = urllib.request.Request(url, headers={
         'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile',
         'Accept': 'application/json',
     })
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode('utf-8', 'ignore'))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode('utf-8', 'ignore'))
+    except urllib.error.URLError as e:
+        if not allow_insecure_retry:
+            raise
+        reason = getattr(e, 'reason', None)
+        if not isinstance(reason, ssl.SSLCertVerificationError):
+            raise
+        log.warning('ssl verify failed for %s, retrying without verification', url)
+        with urllib.request.urlopen(req, timeout=timeout, context=HTTP_INSECURE_CONTEXT) as r:
+            return json.loads(r.read().decode('utf-8', 'ignore'))
+
+
+def piped_instances():
+    import time
+    global _PIPED_INSTANCES_CACHE, _PIPED_INSTANCES_TS
+    if _PIPED_INSTANCES_CACHE and time.time() - _PIPED_INSTANCES_TS < 3600:
+        return _PIPED_INSTANCES_CACHE
+
+    instances = list(PIPED_INSTANCES)
+    try:
+        data = http_get_json(PIPED_INSTANCES_URL, timeout=8, allow_insecure_retry=True)
+        live = []
+        for item in data:
+            api_url = (item.get('api_url') or '').rstrip('/')
+            uptime = float(item.get('uptime_24h') or 0)
+            if api_url.startswith('https://') and uptime >= 80:
+                live.append((uptime, api_url))
+        for _, api_url in sorted(live, reverse=True):
+            if api_url not in instances:
+                instances.append(api_url)
+    except Exception as e:
+        log.warning('could not refresh Piped instances: %s', e)
+
+    _PIPED_INSTANCES_CACHE = instances
+    _PIPED_INSTANCES_TS = time.time()
+    return instances
 
 
 YOUTUBE_VIDEO_ID_RE = re.compile(r'^[A-Za-z0-9_-]{11}$')
@@ -280,11 +325,12 @@ def fetch_via_piped(query):
             ids = []
         if not ids:
             # Try Piped search API
-            for inst in PIPED_INSTANCES[:3]:
+            for inst in piped_instances()[:5]:
                 try:
                     results = http_get_json(
                         inst + '/search?q=' + urllib.parse.quote(query) + '&filter=videos',
                         timeout=8,
+                        allow_insecure_retry=True,
                     )
                     items = results.get('items') or []
                     vids = [extract_video_id(i.get('url', '')) for i in items if i.get('type') == 'stream']
@@ -298,9 +344,9 @@ def fetch_via_piped(query):
         vid = ids[0]
 
     last_err = None
-    for inst in PIPED_INSTANCES:
+    for inst in piped_instances():
         try:
-            streams = http_get_json(inst + '/streams/' + vid, timeout=10)
+            streams = http_get_json(inst + '/streams/' + vid, timeout=10, allow_insecure_retry=True)
             audio = streams.get('audioStreams') or []
             if not audio:
                 raise RuntimeError('no audio streams')
