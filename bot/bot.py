@@ -18,6 +18,14 @@ logging.basicConfig(
 )
 log = logging.getLogger('alxcer')
 
+try:
+    import imageio_ffmpeg
+    FFMPEG_EXECUTABLE = imageio_ffmpeg.get_ffmpeg_exe()
+    log.info('ffmpeg bundled binary: %s', FFMPEG_EXECUTABLE)
+except Exception as e:
+    FFMPEG_EXECUTABLE = 'ffmpeg'
+    log.warning('using system ffmpeg: %s', e)
+
 if not discord.opus.is_loaded():
     for name in ('libopus.so.0', 'libopus.so', 'opus'):
         try:
@@ -729,7 +737,13 @@ async def _start_playback(ctx, track):
     vc = ctx.voice_client
     if not vc or not vc.is_connected():
         return False
-    source = discord.FFmpegPCMAudio(track['url'], before_options=FFMPEG_BEFORE, options=FFMPEG_OPTIONS)
+    source = discord.FFmpegOpusAudio(
+        track['url'],
+        executable=FFMPEG_EXECUTABLE,
+        before_options=FFMPEG_BEFORE,
+        options=FFMPEG_OPTIONS,
+        bitrate=128,
+    )
     vc.play(source, after=lambda err: (
         log.warning('after-play: %s', err) if err else None,
         asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop),
