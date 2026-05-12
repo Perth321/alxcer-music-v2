@@ -32,14 +32,8 @@ def resolve_ffmpeg_executable():
         log.info('ffmpeg system binary: %s', system_ffmpeg)
         return system_ffmpeg
 
-    try:
-        import imageio_ffmpeg
-        bundled_ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-        log.info('ffmpeg bundled binary: %s', bundled_ffmpeg)
-        return bundled_ffmpeg
-    except Exception as e:
-        log.warning('ffmpeg resolution fallback: %s', e)
-        return 'ffmpeg'
+    log.warning('ffmpeg not found in PATH; playback will fail until ffmpeg is installed')
+    return 'ffmpeg'
 
 
 FFMPEG_EXECUTABLE = resolve_ffmpeg_executable()
@@ -59,8 +53,7 @@ FFMPEG_BEFORE = (
     '-reconnect_on_http_error 4xx,5xx -reconnect_delay_max 30 '
     '-rw_timeout 15000000'
 )
-FFMPEG_TRANSCODE_OPTIONS = '-vn -strict -2'
-FFMPEG_COPY_OPTIONS = '-vn'
+FFMPEG_PCM_OPTIONS = '-vn -f s16le -ar 48000 -ac 2'
 COOKIES_FILE = os.path.join(os.path.dirname(__file__), 'cookies.txt')
 
 _cookies_env = os.environ.get('YOUTUBE_COOKIES', '')
@@ -803,16 +796,14 @@ async def _start_playback(ctx, track):
     vc = ctx.voice_client
     if not vc or not vc.is_connected():
         return False
-    codec = 'copy' if (track.get('codec') or '').lower() == 'opus' else 'opus'
-    options = FFMPEG_COPY_OPTIONS if codec == 'copy' else FFMPEG_TRANSCODE_OPTIONS
-    log.info('starting playback: codec=%s title=%s', codec, track.get('title'))
-    source = discord.FFmpegOpusAudio(
+    if not discord.opus.is_loaded():
+        raise RuntimeError('Discord opus library is not loaded')
+    log.info('starting playback via PCM: source_codec=%s title=%s', track.get('codec'), track.get('title'))
+    source = discord.FFmpegPCMAudio(
         track['url'],
         executable=FFMPEG_EXECUTABLE,
         before_options=FFMPEG_BEFORE,
-        options=options,
-        codec=codec,
-        bitrate=128,
+        options=FFMPEG_PCM_OPTIONS,
     )
 
     def after_play(err):
@@ -1080,13 +1071,15 @@ async def testaudio(ctx, seconds: int = 8):
     if vc.is_playing() or vc.is_paused():
         vc.stop()
 
-    source = discord.FFmpegOpusAudio(
+    if not discord.opus.is_loaded():
+        await ctx.send('Discord opus library is not loaded.')
+        return
+
+    source = discord.FFmpegPCMAudio(
         'sine=frequency=880:duration=' + str(seconds),
         executable=FFMPEG_EXECUTABLE,
         before_options='-f lavfi',
-        options=FFMPEG_TRANSCODE_OPTIONS,
-        codec='opus',
-        bitrate=128,
+        options=FFMPEG_PCM_OPTIONS,
     )
 
     def after_test(err):
@@ -1116,7 +1109,11 @@ async def diag(ctx):
             + ' paused=' + str(vc.is_paused())
             + ' channel=' + str(vc.channel)
         )
-    await ctx.send('ffmpeg=`' + FFMPEG_EXECUTABLE + '`\nvoice: `' + voice + '`')
+    await ctx.send(
+        'ffmpeg=`' + FFMPEG_EXECUTABLE + '`\n'
+        + 'opus_loaded=`' + str(discord.opus.is_loaded()) + '`\n'
+        + 'voice: `' + voice + '`'
+    )
 
 
 @bot.command(name='help', aliases=['h', 'commands'])

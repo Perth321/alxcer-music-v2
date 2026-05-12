@@ -30,6 +30,12 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install audio system packages
+        run: |
+          sudo apt-get update -y -o Acquire::Retries=3
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ffmpeg libopus0
+          ffmpeg -hide_banner -version | head -n 1
+
       - name: Install dependencies
         run: |
           pip install --upgrade pip
