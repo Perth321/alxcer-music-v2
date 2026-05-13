@@ -13,6 +13,7 @@ import json
 import logging
 import shutil
 import sys
+import playlist as pl_db
 
 logging.basicConfig(
     level=logging.INFO,
@@ -925,6 +926,22 @@ async def play_next(ctx):
         except Exception as e:
             log.warning('re-fetch failed: %s', e)
 
+    if not next_track.get('url'):
+        fetch_q = next_track.get('query') or next_track.get('webpage_url', '')
+        if fetch_q:
+            try:
+                log.info('lazy-fetch for queued track: %s', next_track.get('title'))
+                fresh = await fetch_track(fetch_q)
+                next_track.update(fresh)
+            except Exception as e:
+                log.warning('lazy-fetch failed "%s": %s', next_track.get('title'), e)
+                try:
+                    await ctx.send('⚠️ ข้ามเพลง **' + next_track.get('title', '?') + '** (หาไม่เจอ)')
+                except Exception:
+                    pass
+                asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
+                return
+
     try:
         ok = await _start_playback(ctx, next_track)
         if not ok:
@@ -943,6 +960,7 @@ async def play_next(ctx):
 async def on_ready():
     log.info('%s online (id=%s)', bot.user, bot.user.id)
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name='!play'))
+    pl_db.load()
 
 
 @bot.event
@@ -1228,8 +1246,360 @@ async def help_cmd(ctx):
     embed.add_field(name='!clear', value='ล้างคิว', inline=True)
     embed.add_field(name='!leave (!dc)', value='ออก voice', inline=True)
     embed.add_field(name='!reconnect (!rc)', value='เชื่อมใหม่', inline=True)
+    embed.add_field(
+        name='📂 Playlist (!pl)',
+        value='`!pl` ดู playlist ทั้งหมด\n`!pl create <ชื่อ>` สร้างใหม่\n`!pl play <ชื่อ>` เล่น\n`!pl add <ชื่อ>` เพิ่มเพลงที่เล่นอยู่\n`!pl view <ชื่อ>` ดูเพลง\n`!pl import <url> [ชื่อ]` import จาก YouTube/Spotify/SoundCloud',
+        inline=False,
+    )
     embed.set_footer(text='ปุ่ม Now Playing: ⏯️ Pause/Resume  ⏭️ Skip  🔁 Loop  🎧 Autoplay  ⏹️ Stop')
     await ctx.send(embed=embed)
+
+
+PL_COLOR = 0xE91E63
+PL_PAGE_SIZE = 10
+
+
+def _source_emoji(source):
+    return {'youtube': '▶️', 'soundcloud': '🔶', 'spotify': '🟢', 'manual': '🎵'}.get(source or 'manual', '🎵')
+
+
+def _pl_list_embed(user, playlists):
+    embed = discord.Embed(
+        title='📂 Playlist ของ ' + user.display_name,
+        color=PL_COLOR,
+    )
+    if not playlists:
+        embed.description = 'ยังไม่มี playlist\nใช้ `!pl create <ชื่อ>` เพื่อสร้าง'
+        return embed
+    lines = []
+    for key, pl in playlists.items():
+        cnt = len(pl.get('tracks', []))
+        lines.append('📁 **' + pl['name'] + '** — ' + str(cnt) + ' เพลง')
+    embed.description = '\n'.join(lines)
+    embed.set_footer(text='!pl play <ชื่อ>  •  !pl view <ชื่อ>  •  !pl import <url>')
+    return embed
+
+
+def _pl_view_embed(pl, page=0):
+    tracks = pl.get('tracks', [])
+    total = len(tracks)
+    total_pages = max(1, (total + PL_PAGE_SIZE - 1) // PL_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * PL_PAGE_SIZE
+    chunk = tracks[start:start + PL_PAGE_SIZE]
+
+    total_dur = sum(t.get('duration', 0) for t in tracks)
+    embed = discord.Embed(
+        title='📁 ' + pl['name'],
+        color=PL_COLOR,
+        description=str(total) + ' เพลง • ' + fmt_duration(total_dur),
+    )
+    if not tracks:
+        embed.description = 'ยังไม่มีเพลงใน playlist นี้'
+        return embed, total_pages
+
+    lines = []
+    for i, t in enumerate(chunk, start + 1):
+        emoji = _source_emoji(t.get('source'))
+        dur = fmt_duration(t.get('duration', 0))
+        lines.append(str(i) + '. ' + emoji + ' **' + t['title'][:50] + '** `' + dur + '`')
+    embed.add_field(name='เพลง', value='\n'.join(lines), inline=False)
+    embed.set_footer(text='หน้า ' + str(page + 1) + '/' + str(total_pages))
+    return embed, total_pages
+
+
+class PlaylistPageView(discord.ui.View):
+    def __init__(self, pl, page=0):
+        super().__init__(timeout=120)
+        self.pl = pl
+        self.page = page
+        _, self.total_pages = _pl_view_embed(pl)
+        self._update_buttons()
+
+    def _update_buttons(self):
+        for child in self.children:
+            if getattr(child, 'custom_id', None) == 'prev':
+                child.disabled = self.page == 0
+            elif getattr(child, 'custom_id', None) == 'next':
+                child.disabled = self.page >= self.total_pages - 1
+
+    @discord.ui.button(emoji='◀️', style=discord.ButtonStyle.secondary, custom_id='prev')
+    async def prev_page(self, i: discord.Interaction, b):
+        self.page -= 1
+        self._update_buttons()
+        embed, _ = _pl_view_embed(self.pl, self.page)
+        await i.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(emoji='▶️', style=discord.ButtonStyle.secondary, custom_id='next')
+    async def next_page(self, i: discord.Interaction, b):
+        self.page += 1
+        self._update_buttons()
+        embed, _ = _pl_view_embed(self.pl, self.page)
+        await i.response.edit_message(embed=embed, view=self)
+
+
+@bot.group(name='playlist', aliases=['pl'], invoke_without_command=True)
+async def playlist_group(ctx):
+    playlists = pl_db.get_all(ctx.author.id)
+    embed = _pl_list_embed(ctx.author, playlists)
+    await ctx.send(embed=embed)
+
+
+@playlist_group.command(name='create', aliases=['new', 'c'])
+async def pl_create(ctx, *, name: str):
+    ok, result = pl_db.create(ctx.author.id, name)
+    if not ok:
+        await ctx.send('❌ ' + result)
+        return
+    embed = discord.Embed(
+        title='✅ สร้าง Playlist แล้ว',
+        description='📁 **' + name + '**\nใช้ `!pl add ' + name + '` เพื่อเพิ่มเพลงที่กำลังเล่น\nหรือ `!pl import <url> ' + name + '` เพื่อ import จากแอพอื่น',
+        color=PL_COLOR,
+    )
+    await ctx.send(embed=embed)
+
+
+@playlist_group.command(name='delete', aliases=['del', 'd'])
+async def pl_delete(ctx, *, name: str):
+    pl = pl_db.get(ctx.author.id, name)
+    if not pl:
+        await ctx.send('❌ ไม่พบ playlist **' + name + '**')
+        return
+    cnt = len(pl.get('tracks', []))
+
+    class ConfirmDelete(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=30)
+            self.confirmed = False
+
+        @discord.ui.button(label='ลบเลย', style=discord.ButtonStyle.danger, emoji='🗑️')
+        async def confirm(self, i: discord.Interaction, b):
+            if i.user.id != ctx.author.id:
+                await i.response.send_message('❌ ไม่ใช่ playlist ของคุณ', ephemeral=True)
+                return
+            pl_db.delete(ctx.author.id, name)
+            self.confirmed = True
+            self.stop()
+            await i.response.edit_message(
+                content='🗑️ ลบ playlist **' + pl['name'] + '** แล้ว (' + str(cnt) + ' เพลง)',
+                embed=None, view=None,
+            )
+
+        @discord.ui.button(label='ยกเลิก', style=discord.ButtonStyle.secondary)
+        async def cancel(self, i: discord.Interaction, b):
+            self.stop()
+            await i.response.edit_message(content='ยกเลิกแล้ว', embed=None, view=None)
+
+    embed = discord.Embed(
+        title='⚠️ ยืนยันการลบ',
+        description='ลบ playlist **' + pl['name'] + '** (' + str(cnt) + ' เพลง) ?\nไม่สามารถกู้คืนได้',
+        color=0xFF6B6B,
+    )
+    await ctx.send(embed=embed, view=ConfirmDelete())
+
+
+@playlist_group.command(name='rename', aliases=['mv'])
+async def pl_rename(ctx, old_name: str, *, new_name: str):
+    ok, result = pl_db.rename(ctx.author.id, old_name, new_name)
+    if not ok:
+        await ctx.send('❌ ' + result)
+        return
+    await ctx.send('✅ เปลี่ยนชื่อ **' + old_name + '** → **' + new_name + '** แล้ว')
+
+
+@playlist_group.command(name='add', aliases=['a'])
+async def pl_add(ctx, *, name: str):
+    track = now_playing.get(ctx.guild.id)
+    if not track:
+        await ctx.send('❌ ไม่มีเพลงเล่นอยู่ตอนนี้')
+        return
+    ok, result = pl_db.add_track(ctx.author.id, name, track)
+    if not ok:
+        await ctx.send('❌ ' + result)
+        return
+    embed = discord.Embed(
+        title='✅ เพิ่มเพลงแล้ว',
+        description='**' + track['title'] + '**\nเพิ่มลง playlist **' + name + '**',
+        color=PL_COLOR,
+    )
+    if track.get('thumbnail'):
+        embed.set_thumbnail(url=track['thumbnail'])
+    await ctx.send(embed=embed)
+
+
+@playlist_group.command(name='remove', aliases=['rm', 'r'])
+async def pl_remove(ctx, playlist_name: str, index: int):
+    ok, result = pl_db.remove_track(ctx.author.id, playlist_name, index)
+    if not ok:
+        await ctx.send('❌ ' + result)
+        return
+    await ctx.send('🗑️ ลบ **' + result['title'] + '** ออกจาก playlist **' + playlist_name + '** แล้ว')
+
+
+@playlist_group.command(name='view', aliases=['show', 'v', 'ls'])
+async def pl_view(ctx, *, name: str):
+    pl = pl_db.get(ctx.author.id, name)
+    if not pl:
+        await ctx.send('❌ ไม่พบ playlist **' + name + '** (ตรวจสอบชื่อด้วย `!pl`)')
+        return
+    embed, total_pages = _pl_view_embed(pl, 0)
+    view = PlaylistPageView(pl, 0) if total_pages > 1 else None
+    await ctx.send(embed=embed, view=view)
+
+
+@playlist_group.command(name='play', aliases=['start', 'p'])
+async def pl_play(ctx, *, name: str):
+    if not ctx.author.voice:
+        await ctx.send('❌ เข้า voice channel ก่อนนะ!')
+        return
+    pl = pl_db.get(ctx.author.id, name)
+    if not pl:
+        await ctx.send('❌ ไม่พบ playlist **' + name + '** (ตรวจสอบชื่อด้วย `!pl`)')
+        return
+    tracks = pl.get('tracks', [])
+    if not tracks:
+        await ctx.send('❌ playlist **' + pl['name'] + '** ว่างเปล่า')
+        return
+
+    try:
+        vc = await ensure_voice(ctx)
+    except Exception as e:
+        await ctx.send('❌ เชื่อมต่อ voice ไม่ได้: ' + str(e))
+        return
+
+    queue = get_queue(ctx.guild.id)
+    entries = [pl_db.track_to_queue_entry(t) for t in tracks]
+
+    if vc.is_playing() or vc.is_paused():
+        queue.extend(entries)
+        embed = discord.Embed(
+            title='📂 เพิ่ม Playlist เข้าคิวแล้ว',
+            description='**' + pl['name'] + '** — ' + str(len(entries)) + ' เพลง',
+            color=PL_COLOR,
+        )
+        await ctx.send(embed=embed)
+    else:
+        first = entries.pop(0)
+        queue.extend(entries)
+        status = await ctx.send('📂 กำลังโหลด **' + pl['name'] + '** (' + str(len(tracks)) + ' เพลง)...')
+        try:
+            fresh = await fetch_track(first.get('query') or first.get('webpage_url', ''))
+            first.update(fresh)
+        except Exception as e:
+            await status.edit(content='❌ เล่นเพลงแรกไม่ได้: ' + str(e))
+            return
+        now_playing[ctx.guild.id] = first
+        if first.get('related_ids'):
+            _autoplay_related[ctx.guild.id] = first['related_ids']
+        try:
+            ok = await _start_playback(ctx, first)
+            if not ok:
+                await status.edit(content='❌ เริ่มเล่นไม่ได้')
+                return
+            embed = discord.Embed(
+                title='📂 เล่น Playlist: ' + pl['name'],
+                description='**[' + first['title'] + '](' + first['webpage_url'] + ')**',
+                color=PL_COLOR,
+            )
+            embed.add_field(name='🎵 คิว', value=str(len(tracks)) + ' เพลง', inline=True)
+            embed.add_field(name='⏱', value=fmt_duration(first['duration']), inline=True)
+            if first.get('thumbnail'):
+                embed.set_thumbnail(url=first['thumbnail'])
+            await status.edit(content=None, embed=embed, view=PlayerView(ctx))
+        except Exception as e:
+            await status.edit(content='❌ เริ่มเล่นไม่ได้: ' + str(e))
+
+
+@playlist_group.command(name='import', aliases=['imp', 'i'])
+async def pl_import(ctx, url: str, *, name: str = None):
+    import_type = pl_db.detect_import_type(url)
+    if not import_type:
+        await ctx.send('❌ รองรับแค่ YouTube Playlist, Spotify Playlist, หรือ SoundCloud Sets')
+        return
+
+    type_labels = {'youtube': '▶️ YouTube', 'spotify': '🟢 Spotify', 'soundcloud': '🔶 SoundCloud'}
+    status = await ctx.send(type_labels.get(import_type, '🔗') + ' กำลัง import playlist...')
+
+    loop = asyncio.get_event_loop()
+    try:
+        if import_type == 'youtube':
+            pl_name, tracks = await loop.run_in_executor(
+                None, lambda: pl_db.import_youtube_playlist(url, piped_instances)
+            )
+        elif import_type == 'soundcloud':
+            pl_name, tracks = await loop.run_in_executor(
+                None, lambda: pl_db.import_soundcloud_playlist(url)
+            )
+        else:
+            pl_name, tracks = await loop.run_in_executor(
+                None, lambda: pl_db.import_spotify_playlist(url)
+            )
+    except Exception as e:
+        await status.edit(content='❌ Import ไม่สำเร็จ: ' + str(e)[:200])
+        return
+
+    if not tracks:
+        await status.edit(content='❌ ไม่พบเพลงใน playlist นั้น')
+        return
+
+    save_name = name or pl_name
+    save_key = save_name.strip().lower()
+
+    existing = pl_db.get(ctx.author.id, save_key)
+    if existing:
+        class OverwriteView(discord.ui.View):
+            def __init__(self):
+                super().__init__(timeout=30)
+                self.choice = None
+
+            @discord.ui.button(label='เขียนทับ', style=discord.ButtonStyle.danger)
+            async def overwrite(self, i: discord.Interaction, b):
+                if i.user.id != ctx.author.id:
+                    await i.response.send_message('ไม่ใช่ของคุณ', ephemeral=True); return
+                self.choice = 'overwrite'
+                self.stop()
+                await i.response.defer()
+
+            @discord.ui.button(label='สร้างใหม่ชื่ออื่น', style=discord.ButtonStyle.primary)
+            async def new_name(self, i: discord.Interaction, b):
+                if i.user.id != ctx.author.id:
+                    await i.response.send_message('ไม่ใช่ของคุณ', ephemeral=True); return
+                self.choice = 'new'
+                self.stop()
+                await i.response.defer()
+
+            @discord.ui.button(label='ยกเลิก', style=discord.ButtonStyle.secondary)
+            async def cancel_btn(self, i: discord.Interaction, b):
+                self.choice = 'cancel'
+                self.stop()
+                await i.response.defer()
+
+        view = OverwriteView()
+        await status.edit(
+            content='⚠️ มี playlist **' + save_name + '** อยู่แล้ว (' + str(len(existing['tracks'])) + ' เพลง)\nต้องการทำอะไร?',
+            view=view,
+        )
+        await view.wait()
+        if view.choice == 'cancel' or view.choice is None:
+            await status.edit(content='ยกเลิกแล้ว', view=None)
+            return
+        if view.choice == 'new':
+            save_name = pl_name + ' (imported)'
+            save_key = save_name.lower()
+
+    pl_db.set_tracks(ctx.author.id, save_key, save_name, tracks)
+
+    embed = discord.Embed(
+        title='✅ Import สำเร็จ!',
+        description='📁 **' + save_name + '**',
+        color=PL_COLOR,
+    )
+    embed.add_field(name=type_labels.get(import_type, '🔗') + ' แหล่งที่มา', value=url[:60] + ('...' if len(url) > 60 else ''), inline=False)
+    embed.add_field(name='🎵 เพลงทั้งหมด', value=str(len(tracks)) + ' เพลง', inline=True)
+    if len(tracks) > pl_db.MAX_TRACKS:
+        embed.add_field(name='⚠️', value='นำเข้าได้สูงสุด ' + str(pl_db.MAX_TRACKS) + ' เพลง', inline=True)
+    embed.set_footer(text='ใช้ !pl play ' + save_name + ' เพื่อเล่น')
+    await status.edit(content=None, embed=embed, view=None)
 
 
 TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
