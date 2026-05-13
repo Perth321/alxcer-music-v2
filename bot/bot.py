@@ -367,6 +367,13 @@ def fetch_via_piped(query):
             stream_url = best['url']
             codec = (best.get('codec') or '').lower()
             log.info('piped ok via %s codec=%s bitrate=%s', inst, codec, best.get('bitrate'))
+            related = streams.get('relatedStreams') or []
+            related_ids = []
+            for r in related:
+                rid = extract_video_id(r.get('url', ''))
+                if rid and len(related_ids) < 10:
+                    related_ids.append(rid)
+            log.info('piped ok via %s codec=%s bitrate=%s related=%d', inst, codec, best.get('bitrate'), len(related_ids))
             return {
                 'url': stream_url,
                 'title': streams.get('title', 'Unknown'),
@@ -376,6 +383,7 @@ def fetch_via_piped(query):
                 'uploader': streams.get('uploader', 'Unknown'),
                 'codec': codec,
                 'query': query,
+                'related_ids': related_ids,
             }
         except Exception as e:
             last_err = e
@@ -649,8 +657,18 @@ bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 queues = {}
 now_playing = {}
 loop_mode = {}
+autoplay_mode = {}
+_autoplay_related = {}
 
 LOOP_LABELS = {'off': 'ปิด', 'one': '🔂 1 เพลง', 'all': '🔁 ทั้งคิว'}
+
+
+def get_autoplay(guild_id):
+    return autoplay_mode.get(guild_id, False)
+
+
+def set_autoplay(guild_id, value):
+    autoplay_mode[guild_id] = value
 
 
 def get_queue(guild_id):
@@ -693,6 +711,7 @@ def make_np_embed(track, guild_id=None):
     embed.add_field(name='🎤 ช่อง', value=track['uploader'], inline=True)
     if guild_id is not None:
         embed.add_field(name='🔁 Loop', value=LOOP_LABELS[get_loop(guild_id)], inline=True)
+        embed.add_field(name='🎧 Autoplay', value='เปิด ✅' if get_autoplay(guild_id) else 'ปิด ❌', inline=True)
     if track.get('thumbnail'):
         embed.set_thumbnail(url=track['thumbnail'])
     return embed
@@ -703,6 +722,7 @@ class PlayerView(discord.ui.View):
         super().__init__(timeout=None)
         self.ctx = ctx
         self._refresh_loop_button()
+        self._refresh_autoplay_button()
 
     def _refresh_loop_button(self):
         mode = get_loop(self.ctx.guild.id)
@@ -711,6 +731,13 @@ class PlayerView(discord.ui.View):
                 child.label = {'off': 'Loop: Off', 'one': 'Loop: 1 เพลง', 'all': 'Loop: ทั้งคิว'}[mode]
                 child.emoji = '🔂' if mode == 'one' else '🔁'
                 child.style = discord.ButtonStyle.secondary if mode == 'off' else discord.ButtonStyle.success
+
+    def _refresh_autoplay_button(self):
+        on = get_autoplay(self.ctx.guild.id)
+        for child in self.children:
+            if getattr(child, 'custom_id', None) == 'autoplay':
+                child.label = 'Autoplay: On' if on else 'Autoplay: Off'
+                child.style = discord.ButtonStyle.success if on else discord.ButtonStyle.secondary
 
     async def _ack(self, i):
         try:
@@ -751,6 +778,21 @@ class PlayerView(discord.ui.View):
             pass
         await i.followup.send('🔁 Loop: **' + LOOP_LABELS[mode] + '**', ephemeral=True)
 
+    @discord.ui.button(emoji='🎧', label='Autoplay: Off', style=discord.ButtonStyle.secondary, custom_id='autoplay')
+    async def autoplay_btn(self, i: discord.Interaction, b):
+        await self._ack(i)
+        on = not get_autoplay(self.ctx.guild.id)
+        set_autoplay(self.ctx.guild.id, on)
+        self._refresh_autoplay_button()
+        try:
+            await i.message.edit(view=self)
+        except Exception:
+            pass
+        await i.followup.send(
+            '🎧 Autoplay: **' + ('เปิด ✅ — เมื่อคิวหมดจะเล่นเพลงที่เกี่ยวข้องต่อ' if on else 'ปิด ❌') + '**',
+            ephemeral=True,
+        )
+
     @discord.ui.button(emoji='⏹️', label='Stop', style=discord.ButtonStyle.danger, custom_id='stop')
     async def stop_btn(self, i: discord.Interaction, b):
         await self._ack(i)
@@ -758,7 +800,9 @@ class PlayerView(discord.ui.View):
         if vc:
             queues[self.ctx.guild.id] = []
             now_playing.pop(self.ctx.guild.id, None)
+            _autoplay_related.pop(self.ctx.guild.id, None)
             set_loop(self.ctx.guild.id, 'off')
+            set_autoplay(self.ctx.guild.id, False)
             vc.stop()
             try:
                 await vc.disconnect(force=True)
@@ -822,6 +866,21 @@ async def _start_playback(ctx, track):
     return True
 
 
+async def fetch_autoplay_track(guild_id):
+    """Pick next related video from stored related_ids and fetch it via Piped."""
+    related = _autoplay_related.get(guild_id) or []
+    if not related:
+        return None
+    vid = related.pop(0)
+    _autoplay_related[guild_id] = related
+    log.info('autoplay: fetching related video %s', vid)
+    url = 'https://www.youtube.com/watch?v=' + vid
+    loop = asyncio.get_event_loop()
+    track = await loop.run_in_executor(None, lambda: fetch_via_piped(url))
+    track['query'] = url
+    return track
+
+
 async def play_next(ctx):
     guild_id = ctx.guild.id
     mode = get_loop(guild_id)
@@ -834,11 +893,28 @@ async def play_next(ctx):
         if mode == 'all' and current:
             queue.append(current)
         if not queue:
-            now_playing.pop(guild_id, None)
-            return
-        next_track = queue.pop(0)
+            if get_autoplay(guild_id) and mode == 'off':
+                try:
+                    next_track = await fetch_autoplay_track(guild_id)
+                    if not next_track:
+                        now_playing.pop(guild_id, None)
+                        await ctx.send('🎧 Autoplay: ไม่มีเพลงที่เกี่ยวข้องแล้ว')
+                        return
+                    log.info('autoplay: playing %s', next_track.get('title'))
+                except Exception as e:
+                    log.warning('autoplay fetch failed: %s', e)
+                    now_playing.pop(guild_id, None)
+                    return
+            else:
+                now_playing.pop(guild_id, None)
+                return
+        else:
+            next_track = queue.pop(0)
 
     now_playing[guild_id] = next_track
+
+    if next_track.get('related_ids'):
+        _autoplay_related[guild_id] = next_track['related_ids']
 
     needs_refetch = (mode == 'one') or (mode == 'all' and next_track is current)
     if needs_refetch and next_track.get('query'):
@@ -951,7 +1027,8 @@ async def show_queue(ctx):
     queue = get_queue(ctx.guild.id)
     np = now_playing.get(ctx.guild.id)
     embed = discord.Embed(title='📋 คิวเพลง', color=0x5865F2)
-    embed.add_field(name='🔁 Loop', value=LOOP_LABELS[get_loop(ctx.guild.id)], inline=False)
+    embed.add_field(name='🔁 Loop', value=LOOP_LABELS[get_loop(ctx.guild.id)], inline=True)
+    embed.add_field(name='🎧 Autoplay', value='เปิด ✅' if get_autoplay(ctx.guild.id) else 'ปิด ❌', inline=True)
     if np:
         embed.add_field(name='🎵 กำลังเล่น', value='**' + np['title'] + '**  ' + fmt_duration(np['duration']), inline=False)
     if queue:
@@ -1019,7 +1096,9 @@ async def leave(ctx):
     if ctx.voice_client:
         queues[ctx.guild.id] = []
         now_playing.pop(ctx.guild.id, None)
+        _autoplay_related.pop(ctx.guild.id, None)
         set_loop(ctx.guild.id, 'off')
+        set_autoplay(ctx.guild.id, False)
         await ctx.voice_client.disconnect(force=True)
         await ctx.send('👋 ออกจาก voice แล้ว')
     else:
@@ -1031,12 +1110,24 @@ async def stop(ctx):
     if ctx.voice_client:
         queues[ctx.guild.id] = []
         now_playing.pop(ctx.guild.id, None)
+        _autoplay_related.pop(ctx.guild.id, None)
         set_loop(ctx.guild.id, 'off')
+        set_autoplay(ctx.guild.id, False)
         ctx.voice_client.stop()
         await ctx.voice_client.disconnect(force=True)
         await ctx.send('⏹️ หยุดและออกจาก voice แล้ว')
     else:
         await ctx.send('❌ บอทไม่ได้อยู่ใน voice')
+
+
+@bot.command(name='autoplay', aliases=['ap'])
+async def autoplay_cmd(ctx):
+    on = not get_autoplay(ctx.guild.id)
+    set_autoplay(ctx.guild.id, on)
+    if on:
+        await ctx.send('🎧 Autoplay **เปิด ✅** — เมื่อคิวหมด บอทจะเล่นเพลงที่เกี่ยวข้องต่อเองอัตโนมัติ')
+    else:
+        await ctx.send('🎧 Autoplay **ปิด ❌**')
 
 
 @bot.command(name='reconnect', aliases=['rc'])
@@ -1129,12 +1220,13 @@ async def help_cmd(ctx):
     embed.add_field(name='!queue (!q)', value='ดูคิว', inline=True)
     embed.add_field(name='!np', value='Now Playing + ปุ่ม', inline=True)
     embed.add_field(name='!loop [off|one|all]', value='โหมด Loop', inline=True)
+    embed.add_field(name='!autoplay (!ap)', value='เปิด/ปิด เล่นต่ออัตโนมัติ', inline=True)
     embed.add_field(name='!pause / !resume', value='หยุด / เล่นต่อ', inline=True)
     embed.add_field(name='!stop', value='หยุด + ออก voice', inline=True)
     embed.add_field(name='!clear', value='ล้างคิว', inline=True)
     embed.add_field(name='!leave (!dc)', value='ออก voice', inline=True)
     embed.add_field(name='!reconnect (!rc)', value='เชื่อมใหม่', inline=True)
-    embed.set_footer(text='ปุ่ม Now Playing: ⏯️ Pause/Resume  ⏭️ Skip  🔁 Loop  ⏹️ Stop')
+    embed.set_footer(text='ปุ่ม Now Playing: ⏯️ Pause/Resume  ⏭️ Skip  🔁 Loop  🎧 Autoplay  ⏹️ Stop')
     await ctx.send(embed=embed)
 
 
