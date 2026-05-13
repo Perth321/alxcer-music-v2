@@ -660,6 +660,8 @@ now_playing = {}
 loop_mode = {}
 autoplay_mode = {}
 _autoplay_related = {}
+volume_levels = {}
+_volume_sources = {}
 
 LOOP_LABELS = {'off': 'ปิด', 'one': '🔂 1 เพลง', 'all': '🔁 ทั้งคิว'}
 
@@ -670,6 +672,19 @@ def get_autoplay(guild_id):
 
 def set_autoplay(guild_id, value):
     autoplay_mode[guild_id] = value
+
+
+def get_volume(guild_id):
+    return volume_levels.get(guild_id, 1.0)
+
+
+def set_volume(guild_id, vol):
+    vol = max(0.1, min(2.0, round(vol, 1)))
+    volume_levels[guild_id] = vol
+    src = _volume_sources.get(guild_id)
+    if src:
+        src.volume = vol
+    return vol
 
 
 def get_queue(guild_id):
@@ -713,10 +728,16 @@ def make_np_embed(track, guild_id=None):
     if guild_id is not None:
         embed.add_field(name='🔁 Loop', value=LOOP_LABELS[get_loop(guild_id)], inline=True)
         embed.add_field(name='🎧 Autoplay', value='เปิด ✅' if get_autoplay(guild_id) else 'ปิด ❌', inline=True)
+        vol_pct = int(get_volume(guild_id) * 100)
+        filled = vol_pct // 10
+        vol_bar = '▓' * filled + '░' * (10 - filled)
+        embed.add_field(name='🔊 Volume', value=vol_bar + ' ' + str(vol_pct) + '%', inline=True)
+        queue = get_queue(guild_id)
+        if queue:
+            embed.add_field(name='📋 คิวถัดไป', value=str(len(queue)) + ' เพลง', inline=True)
     if track.get('thumbnail'):
         embed.set_thumbnail(url=track['thumbnail'])
     return embed
-
 
 class PlayerView(discord.ui.View):
     def __init__(self, ctx):
@@ -746,7 +767,17 @@ class PlayerView(discord.ui.View):
         except Exception:
             pass
 
-    @discord.ui.button(emoji='⏯️', label='Pause/Resume', style=discord.ButtonStyle.primary, custom_id='pp')
+    async def _update_embed(self, i):
+        track = now_playing.get(self.ctx.guild.id)
+        if track:
+            try:
+                await i.message.edit(embed=make_np_embed(track, self.ctx.guild.id), view=self)
+            except Exception:
+                pass
+
+    # ── Row 1: Playback controls ──────────────────────────────────────────────
+
+    @discord.ui.button(emoji='⏯️', label='Pause/Resume', style=discord.ButtonStyle.primary, custom_id='pp', row=0)
     async def pause_resume(self, i: discord.Interaction, b):
         await self._ack(i)
         vc = self.ctx.voice_client
@@ -759,7 +790,7 @@ class PlayerView(discord.ui.View):
         else:
             await i.followup.send('❌ ไม่มีเพลงเล่นอยู่', ephemeral=True)
 
-    @discord.ui.button(emoji='⏭️', label='Skip', style=discord.ButtonStyle.primary, custom_id='skip')
+    @discord.ui.button(emoji='⏭️', label='Skip', style=discord.ButtonStyle.primary, custom_id='skip', row=0)
     async def skip_btn(self, i: discord.Interaction, b):
         await self._ack(i)
         vc = self.ctx.voice_client
@@ -768,33 +799,27 @@ class PlayerView(discord.ui.View):
         else:
             await i.followup.send('❌ ไม่มีเพลงเล่นอยู่', ephemeral=True)
 
-    @discord.ui.button(emoji='🔁', label='Loop: Off', style=discord.ButtonStyle.secondary, custom_id='loop')
+    @discord.ui.button(emoji='🔁', label='Loop: Off', style=discord.ButtonStyle.secondary, custom_id='loop', row=0)
     async def loop_btn(self, i: discord.Interaction, b):
         await self._ack(i)
         mode = cycle_loop(self.ctx.guild.id)
         self._refresh_loop_button()
-        try:
-            await i.message.edit(view=self)
-        except Exception:
-            pass
+        await self._update_embed(i)
         await i.followup.send('🔁 Loop: **' + LOOP_LABELS[mode] + '**', ephemeral=True)
 
-    @discord.ui.button(emoji='🎧', label='Autoplay: Off', style=discord.ButtonStyle.secondary, custom_id='autoplay')
+    @discord.ui.button(emoji='🎧', label='Autoplay: Off', style=discord.ButtonStyle.secondary, custom_id='autoplay', row=0)
     async def autoplay_btn(self, i: discord.Interaction, b):
         await self._ack(i)
         on = not get_autoplay(self.ctx.guild.id)
         set_autoplay(self.ctx.guild.id, on)
         self._refresh_autoplay_button()
-        try:
-            await i.message.edit(view=self)
-        except Exception:
-            pass
+        await self._update_embed(i)
         await i.followup.send(
             '🎧 Autoplay: **' + ('เปิด ✅ — เมื่อคิวหมดจะเล่นเพลงที่เกี่ยวข้องต่อ' if on else 'ปิด ❌') + '**',
             ephemeral=True,
         )
 
-    @discord.ui.button(emoji='⏹️', label='Stop', style=discord.ButtonStyle.danger, custom_id='stop')
+    @discord.ui.button(emoji='⏹️', label='Stop', style=discord.ButtonStyle.danger, custom_id='stop', row=0)
     async def stop_btn(self, i: discord.Interaction, b):
         await self._ack(i)
         vc = self.ctx.voice_client
@@ -802,6 +827,7 @@ class PlayerView(discord.ui.View):
             queues[self.ctx.guild.id] = []
             now_playing.pop(self.ctx.guild.id, None)
             _autoplay_related.pop(self.ctx.guild.id, None)
+            _volume_sources.pop(self.ctx.guild.id, None)
             set_loop(self.ctx.guild.id, 'off')
             set_autoplay(self.ctx.guild.id, False)
             vc.stop()
@@ -812,6 +838,96 @@ class PlayerView(discord.ui.View):
             await i.followup.send('⏹️ หยุดและออกจาก voice', ephemeral=True)
         else:
             await i.followup.send('❌ บอทไม่ได้อยู่ใน voice', ephemeral=True)
+
+    # ── Row 2: Queue, Shuffle, Add to PL, Volume ─────────────────────────────
+
+    @discord.ui.button(emoji='📋', label='Queue', style=discord.ButtonStyle.secondary, custom_id='queue_btn', row=1)
+    async def queue_btn(self, i: discord.Interaction, b):
+        await self._ack(i)
+        queue = get_queue(self.ctx.guild.id)
+        np = now_playing.get(self.ctx.guild.id)
+        embed = discord.Embed(title='📋 คิวเพลง', color=0x5865F2)
+        if np:
+            embed.add_field(
+                name='🎵 กำลังเล่น',
+                value='**' + np['title'][:60] + '** `' + fmt_duration(np['duration']) + '`',
+                inline=False,
+            )
+        if queue:
+            lines = [str(idx) + '. **' + t['title'][:50] + '** `' + fmt_duration(t['duration']) + '`'
+                     for idx, t in enumerate(queue[:10], 1)]
+            if len(queue) > 10:
+                lines.append('...อีก ' + str(len(queue) - 10) + ' เพลง')
+            embed.add_field(name='ถัดไป (' + str(len(queue)) + ')', value='\n'.join(lines), inline=False)
+        elif not np:
+            embed.description = 'คิวว่างเปล่า 🎵'
+        embed.add_field(name='🔁 Loop', value=LOOP_LABELS[get_loop(self.ctx.guild.id)], inline=True)
+        embed.add_field(name='🎧 Autoplay', value='เปิด ✅' if get_autoplay(self.ctx.guild.id) else 'ปิด ❌', inline=True)
+        await i.followup.send(embed=embed, ephemeral=True)
+
+    @discord.ui.button(emoji='🔀', label='Shuffle', style=discord.ButtonStyle.secondary, custom_id='shuffle_btn', row=1)
+    async def shuffle_btn(self, i: discord.Interaction, b):
+        await self._ack(i)
+        import random
+        queue = get_queue(self.ctx.guild.id)
+        if not queue:
+            await i.followup.send('❌ คิวว่างเปล่า', ephemeral=True); return
+        random.shuffle(queue)
+        await i.followup.send('🔀 สับเปลี่ยนคิว **' + str(len(queue)) + '** เพลงแล้ว', ephemeral=True)
+
+    @discord.ui.button(emoji='➕', label='Add to PL', style=discord.ButtonStyle.secondary, custom_id='addpl_btn', row=1)
+    async def addpl_btn(self, i: discord.Interaction, b):
+        await self._ack(i)
+        track = now_playing.get(self.ctx.guild.id)
+        if not track:
+            await i.followup.send('❌ ไม่มีเพลงเล่นอยู่', ephemeral=True); return
+        playlists = pl_db.get_all(i.user.id)
+        if not playlists:
+            await i.followup.send('❌ ยังไม่มี playlist\nใช้ `!pl create <ชื่อ>` เพื่อสร้าง', ephemeral=True); return
+        options = [
+            discord.SelectOption(
+                label=pl['name'][:25],
+                value=key,
+                description=str(len(pl.get('tracks', []))) + ' เพลง',
+                emoji='📁',
+            )
+            for key, pl in list(playlists.items())[:25]
+        ]
+        select = discord.ui.Select(placeholder='เลือก playlist ที่จะเพิ่มเพลง...', options=options, custom_id='pl_select')
+        pl_snapshot = dict(playlists)
+        track_snapshot = dict(track)
+        user_id = i.user.id
+
+        async def select_callback(sel_i: discord.Interaction):
+            chosen_key = select.values[0]
+            ok, result = pl_db.add_track(user_id, chosen_key, track_snapshot)
+            pl_name = pl_snapshot[chosen_key]['name'] if chosen_key in pl_snapshot else chosen_key
+            if ok:
+                await sel_i.response.edit_message(
+                    content='✅ เพิ่ม **' + track_snapshot['title'][:50] + '** ลง playlist **' + pl_name + '** แล้ว',
+                    view=None,
+                )
+            else:
+                await sel_i.response.edit_message(content='❌ ' + result, view=None)
+
+        select.callback = select_callback
+        view = discord.ui.View(timeout=30)
+        view.add_item(select)
+        await i.followup.send('➕ เพิ่ม **' + track['title'][:50] + '** ลง playlist ไหน?', view=view, ephemeral=True)
+
+    @discord.ui.button(emoji='🔉', label='Vol-', style=discord.ButtonStyle.secondary, custom_id='vol_down', row=1)
+    async def vol_down(self, i: discord.Interaction, b):
+        await self._ack(i)
+        new_vol = set_volume(self.ctx.guild.id, get_volume(self.ctx.guild.id) - 0.1)
+        await self._update_embed(i)
+        await i.followup.send('🔉 Volume: **' + str(int(new_vol * 100)) + '%**', ephemeral=True)
+
+    @discord.ui.button(emoji='🔊', label='Vol+', style=discord.ButtonStyle.secondary, custom_id='vol_up', row=1)
+    async def vol_up(self, i: discord.Interaction, b):
+        await self._ack(i)
+        new_vol = set_volume(self.ctx.guild.id, get_volume(self.ctx.guild.id) + 0.1)
+        await self._update_embed(i)
+        await i.followup.send('🔊 Volume: **' + str(int(new_vol * 100)) + '%**', ephemeral=True)
 
 
 async def ensure_voice(ctx):
@@ -844,12 +960,14 @@ async def _start_playback(ctx, track):
     if not discord.opus.is_loaded():
         raise RuntimeError('Discord opus library is not loaded')
     log.info('starting playback via PCM: source_codec=%s title=%s', track.get('codec'), track.get('title'))
-    source = discord.FFmpegPCMAudio(
+    raw_source = discord.FFmpegPCMAudio(
         track['url'],
         executable=FFMPEG_EXECUTABLE,
         before_options=FFMPEG_BEFORE,
         options=FFMPEG_PCM_OPTIONS,
     )
+    source = discord.PCMVolumeTransformer(raw_source, volume=get_volume(ctx.guild.id))
+    _volume_sources[ctx.guild.id] = source
 
     def after_play(err):
         if err:
@@ -1111,6 +1229,31 @@ async def clear_queue(ctx):
     await ctx.send('🗑️ ล้างคิวแล้ว')
 
 
+
+@bot.command(name='shuffle', aliases=['sh'])
+async def shuffle_queue(ctx):
+    import random
+    queue = get_queue(ctx.guild.id)
+    if not queue:
+        await ctx.send('❌ คิวว่างเปล่า')
+        return
+    random.shuffle(queue)
+    await ctx.send('🔀 สับเปลี่ยนคิว **' + str(len(queue)) + '** เพลงแล้ว')
+
+
+@bot.command(name='volume', aliases=['vol'])
+async def volume_cmd(ctx, level: int = None):
+    if level is None:
+        vol_pct = int(get_volume(ctx.guild.id) * 100)
+        await ctx.send('🔊 Volume ปัจจุบัน: **' + str(vol_pct) + '%**')
+        return
+    if not 10 <= level <= 200:
+        await ctx.send('❌ ใส่ระหว่าง 10–200')
+        return
+    new_vol = set_volume(ctx.guild.id, level / 100.0)
+    await ctx.send('🔊 Volume: **' + str(int(new_vol * 100)) + '%**')
+
+
 @bot.command(name='leave', aliases=['dc', 'disconnect'])
 async def leave(ctx):
     if ctx.voice_client:
@@ -1246,12 +1389,14 @@ async def help_cmd(ctx):
     embed.add_field(name='!clear', value='ล้างคิว', inline=True)
     embed.add_field(name='!leave (!dc)', value='ออก voice', inline=True)
     embed.add_field(name='!reconnect (!rc)', value='เชื่อมใหม่', inline=True)
+    embed.add_field(name='!shuffle (!sh)', value='สับเปลี่ยนคิว', inline=True)
+    embed.add_field(name='!volume [10-200]', value='ปรับความดัง', inline=True)
     embed.add_field(
         name='📂 Playlist (!pl)',
         value='`!pl` ดู playlist ทั้งหมด\n`!pl create <ชื่อ>` สร้างใหม่\n`!pl play <ชื่อ>` เล่น\n`!pl add <ชื่อ>` เพิ่มเพลงที่เล่นอยู่\n`!pl view <ชื่อ>` ดูเพลง\n`!pl import <url> [ชื่อ]` import จาก YouTube/Spotify/SoundCloud',
         inline=False,
     )
-    embed.set_footer(text='ปุ่ม Now Playing: ⏯️ Pause/Resume  ⏭️ Skip  🔁 Loop  🎧 Autoplay  ⏹️ Stop')
+    embed.set_footer(text='Row 1: ⏯️ Pause/Resume  ⏭️ Skip  🔁 Loop  🎧 Autoplay  ⏹️ Stop\nRow 2: 📋 Queue  🔀 Shuffle  ➕ Add to PL  🔉 Vol-  🔊 Vol+')
     await ctx.send(embed=embed)
 
 
