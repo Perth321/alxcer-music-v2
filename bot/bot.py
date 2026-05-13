@@ -1003,6 +1003,8 @@ async def play(ctx, *, query):
         await status.edit(content=None, embed=embed)
     else:
         now_playing[ctx.guild.id] = track
+        if track.get('related_ids'):
+            _autoplay_related[ctx.guild.id] = track['related_ids']
         try:
             ok = await _start_playback(ctx, track)
             if not ok:
