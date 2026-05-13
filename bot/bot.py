@@ -1483,11 +1483,165 @@ class PlaylistPageView(discord.ui.View):
         await i.response.edit_message(embed=embed, view=self)
 
 
+
+# ── Playlist Import Modal ─────────────────────────────────────────────────────
+
+class ImportPlaylistModal(discord.ui.Modal, title='📥 Import Playlist จากแอพอื่น'):
+    url_input = discord.ui.TextInput(
+        label='URL Playlist',
+        placeholder='https://open.spotify.com/playlist/...  หรือ YouTube / SoundCloud',
+        style=discord.TextStyle.short,
+        required=True,
+        max_length=500,
+    )
+    name_input = discord.ui.TextInput(
+        label='ตั้งชื่อ Playlist (ไม่บังคับ)',
+        placeholder='เว้นว่างเพื่อใช้ชื่อต้นฉบับ',
+        style=discord.TextStyle.short,
+        required=False,
+        max_length=80,
+    )
+
+    def __init__(self, ctx):
+        super().__init__()
+        self.ctx = ctx
+
+    async def on_submit(self, i: discord.Interaction):
+        url = self.url_input.value.strip()
+        custom_name = self.name_input.value.strip() or None
+
+        import_type = pl_db.detect_import_type(url)
+        type_labels = {
+            'youtube': '▶️ YouTube',
+            'spotify': '🟢 Spotify',
+            'soundcloud': '🔶 SoundCloud',
+        }
+        if not import_type:
+            await i.response.send_message(
+                '❌ รองรับแค่ YouTube Playlist, Spotify Playlist, หรือ SoundCloud Sets\n'
+                'ตัวอย่าง:\n'
+                '• `https://open.spotify.com/playlist/...`\n'
+                '• `https://youtube.com/playlist?list=...`\n'
+                '• `https://soundcloud.com/user/sets/...`',
+                ephemeral=True,
+            )
+            return
+
+        await i.response.send_message(
+            type_labels.get(import_type, '🔗') + ' กำลัง import playlist... รอสักครู่ 🔄',
+            ephemeral=True,
+        )
+
+        loop = asyncio.get_event_loop()
+        try:
+            if import_type == 'youtube':
+                pl_name, tracks = await loop.run_in_executor(
+                    None, lambda: pl_db.import_youtube_playlist(url, piped_instances)
+                )
+            elif import_type == 'soundcloud':
+                pl_name, tracks = await loop.run_in_executor(
+                    None, lambda: pl_db.import_soundcloud_playlist(url)
+                )
+            else:
+                pl_name, tracks = await loop.run_in_executor(
+                    None, lambda: pl_db.import_spotify_playlist(url)
+                )
+        except Exception as e:
+            await i.edit_original_response(content='❌ Import ไม่สำเร็จ: ' + str(e)[:200])
+            return
+
+        if not tracks:
+            await i.edit_original_response(content='❌ ไม่พบเพลงใน playlist นั้น')
+            return
+
+        save_name = custom_name or pl_name
+        save_key = save_name.strip().lower()
+        existing = pl_db.get(i.user.id, save_key)
+
+        if existing:
+            old_cnt = len(existing.get('tracks', []))
+            save_name = save_name + ' (imported)'
+            save_key = save_name.lower()
+
+        pl_db.set_tracks(i.user.id, save_key, save_name, tracks)
+
+        embed = discord.Embed(
+            title='✅ Import สำเร็จ!',
+            description='📁 **' + save_name + '**',
+            color=PL_COLOR,
+        )
+        embed.add_field(name=type_labels.get(import_type, '🔗') + ' แหล่งที่มา', value=url[:80], inline=False)
+        embed.add_field(name='🎵 เพลงทั้งหมด', value=str(len(tracks)) + ' เพลง', inline=True)
+        if existing:
+            embed.add_field(name='ℹ️', value='มีชื่อซ้ำ บันทึกเป็น **' + save_name + '**', inline=True)
+        embed.set_footer(text='ใช้ !pl play ' + save_name + ' เพื่อเล่น')
+        await i.edit_original_response(content=None, embed=embed)
+
+
+# ── Playlist Manager View ─────────────────────────────────────────────────────
+
+class PlaylistManagerView(discord.ui.View):
+    def __init__(self, ctx):
+        super().__init__(timeout=120)
+        self.ctx = ctx
+
+    @discord.ui.button(emoji='📥', label='Import จาก Spotify / YouTube / SoundCloud',
+                       style=discord.ButtonStyle.success, custom_id='import_pl', row=0)
+    async def import_btn(self, i: discord.Interaction, b):
+        if i.user.id != self.ctx.author.id:
+            await i.response.send_message('❌ ปุ่มนี้สำหรับ ' + self.ctx.author.mention + ' เท่านั้น', ephemeral=True)
+            return
+        await i.response.send_modal(ImportPlaylistModal(self.ctx))
+
+    @discord.ui.button(emoji='➕', label='สร้าง Playlist ใหม่',
+                       style=discord.ButtonStyle.primary, custom_id='create_pl', row=0)
+    async def create_btn(self, i: discord.Interaction, b):
+        if i.user.id != self.ctx.author.id:
+            await i.response.send_message('❌ ปุ่มนี้สำหรับ ' + self.ctx.author.mention + ' เท่านั้น', ephemeral=True)
+            return
+        await i.response.send_modal(CreatePlaylistModal(self.ctx))
+
+    @discord.ui.button(emoji='🔄', label='รีเฟรช',
+                       style=discord.ButtonStyle.secondary, custom_id='refresh_pl', row=0)
+    async def refresh_btn(self, i: discord.Interaction, b):
+        if i.user.id != self.ctx.author.id:
+            await i.response.send_message('❌ ปุ่มนี้สำหรับ ' + self.ctx.author.mention + ' เท่านั้น', ephemeral=True)
+            return
+        playlists = pl_db.get_all(i.user.id)
+        embed = _pl_list_embed(i.user, playlists)
+        await i.response.edit_message(embed=embed, view=self)
+
+
+class CreatePlaylistModal(discord.ui.Modal, title='➕ สร้าง Playlist ใหม่'):
+    name_input = discord.ui.TextInput(
+        label='ชื่อ Playlist',
+        placeholder='เช่น เพลงโปรด, Chill Vibes, ...',
+        style=discord.TextStyle.short,
+        required=True,
+        max_length=80,
+    )
+
+    def __init__(self, ctx):
+        super().__init__()
+        self.ctx = ctx
+
+    async def on_submit(self, i: discord.Interaction):
+        name = self.name_input.value.strip()
+        ok, result = pl_db.create(i.user.id, name)
+        if not ok:
+            await i.response.send_message('❌ ' + result, ephemeral=True)
+            return
+        playlists = pl_db.get_all(i.user.id)
+        embed = _pl_list_embed(i.user, playlists)
+        embed.colour = discord.Colour.green()
+        embed.set_footer(text='✅ สร้าง "' + name + '" แล้ว')
+        await i.response.edit_message(embed=embed, view=PlaylistManagerView(self.ctx))
+
 @bot.group(name='playlist', aliases=['pl'], invoke_without_command=True)
 async def playlist_group(ctx):
     playlists = pl_db.get_all(ctx.author.id)
     embed = _pl_list_embed(ctx.author, playlists)
-    await ctx.send(embed=embed)
+    await ctx.send(embed=embed, view=PlaylistManagerView(ctx))
 
 
 @playlist_group.command(name='create', aliases=['new', 'c'])
