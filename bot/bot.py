@@ -71,16 +71,17 @@ HTTP_INSECURE_CONTEXT = ssl._create_unverified_context()
 
 PIPED_INSTANCES = [
     'https://api.piped.private.coffee',
-    'https://api.piped.projectsegfau.lt',
-    'https://pipedapi.tokhmi.xyz',
     'https://pipedapi.kavin.rocks',
+    'https://api.piped.projectsegfau.lt',
     'https://pipedapi.adminforge.de',
-    'https://pipedapi.syncpundit.io',
-    'https://pipedapi.drgns.space',
     'https://piped-api.garudalinux.org',
+    'https://pipedapi.tokhmi.xyz',
     'https://pa.il.shn.hk',
     'https://pipedapi.lunar.icu',
-    'https://piped.drgns.space',
+    'https://piped.ngn.tf',
+    'https://pipedapi.jottacloud.com',
+    'https://api.piped.yt',
+    'https://piped.video/api',
 ]
 
 # Invidious — last resort
@@ -89,12 +90,14 @@ _PIPED_INSTANCES_CACHE = None
 _PIPED_INSTANCES_TS = 0
 
 INVIDIOUS_INSTANCES = [
-    'https://invidious.privacyredirect.com',
-    'https://invidious.nerdvpn.de',
     'https://inv.nadeko.net',
+    'https://invidious.privacyredirect.com',
     'https://yewtu.be',
+    'https://invidious.nerdvpn.de',
+    'https://iv.datura.network',
     'https://invidious.io.lol',
     'https://invidious.f5.si',
+    'https://invidious.perennialte.ch',
 ]
 
 
@@ -440,13 +443,27 @@ def fetch_via_pytubefix(query):
         raise RuntimeError('pytubefix not installed')
 
     q = clean_query(query)
+    po_token_verifier = None
+    try:
+        from pytubefix.contrib.po_token import TokenFileCache
+        po_token_verifier = TokenFileCache(path='/tmp/yt_po_tokens.json')
+    except Exception:
+        pass
+
     if is_youtube_url(q):
-        yt = YouTube(canonical_youtube_url(q), use_oauth=False, allow_oauth_cache=False)
+        yt = YouTube(
+            canonical_youtube_url(q),
+            use_oauth=False,
+            allow_oauth_cache=False,
+            po_token_verifier=po_token_verifier,
+        )
     else:
-        results = Search(q).videos
+        results = Search(q, use_oauth=False).videos
         if not results:
             raise RuntimeError('no results from pytubefix search')
         yt = results[0]
+        if po_token_verifier:
+            yt = YouTube(yt.watch_url, use_oauth=False, allow_oauth_cache=False, po_token_verifier=po_token_verifier)
 
     audio = yt.streams.filter(only_audio=True).order_by('abr').last()
     if not audio:
@@ -479,19 +496,20 @@ def ytdlp_target(query):
 def fetch_via_ytdlp(query, cookiefile=None, label='yt-dlp'):
     """yt-dlp fallback for direct URLs and YouTube searches."""
     opts = {
-        'format': 'bestaudio[ext=m4a]/bestaudio/best',
+        'format': 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
         'quiet': True,
         'no_warnings': True,
         'noplaylist': True,
-        'source_address': '0.0.0.0',
-        'geo_bypass': True,
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'web'],
+                # tv_embedded and ios clients bypass bot detection on GitHub Actions IPs
+                'player_client': ['tv_embedded', 'ios', 'mweb'],
+                'player_skip': ['configs'],
             },
         },
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120',
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.6778.200 Mobile Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
         },
     }
     if cookiefile:
@@ -511,6 +529,72 @@ def fetch_via_ytdlp(query, cookiefile=None, label='yt-dlp'):
         'thumbnail': data.get('thumbnail'),
         'webpage_url': data.get('webpage_url', target),
         'uploader': data.get('uploader', 'Unknown'),
+        'query': query,
+    }
+
+
+
+def fetch_via_innertube(query):
+    '''Direct YouTube InnerTube API — works even when yt-dlp player clients fail.'''
+    import json as _json
+    query = clean_query(query)
+    vid = extract_video_id(query)
+    if not vid:
+        try:
+            ids = youtube_html_search(query, n=1)
+        except Exception:
+            ids = []
+        if not ids:
+            raise RuntimeError('no video ID for innertube')
+        vid = ids[0]
+
+    # Use TV Embedded client — no sign-in required, no PO token needed
+    payload = _json.dumps({
+        'videoId': vid,
+        'context': {
+            'client': {
+                'clientName': 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
+                'clientVersion': '2.0',
+                'hl': 'en',
+            }
+        }
+    }).encode()
+    req = urllib.request.Request(
+        'https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8',
+        data=payload,
+        headers={
+            'Content-Type': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/6.0 TV Safari/538.1',
+            'X-YouTube-Client-Name': '85',
+            'X-YouTube-Client-Version': '2.0',
+        },
+        method='POST',
+    )
+    with urllib.request.urlopen(req, timeout=12) as r:
+        data = _json.loads(r.read())
+
+    streaming = data.get('streamingData') or {}
+    fmts = streaming.get('adaptiveFormats') or streaming.get('formats') or []
+    audio = [f for f in fmts if f.get('mimeType', '').startswith('audio/')]
+    if not audio:
+        raise RuntimeError('no audio formats from innertube')
+    audio.sort(key=lambda f: f.get('bitrate', 0), reverse=True)
+    best = audio[0]
+    stream_url = best.get('url') or best.get('signatureCipher')
+    if not stream_url or not stream_url.startswith('http'):
+        raise RuntimeError('innertube: stream URL requires signature cipher (sign-in needed)')
+    title = (data.get('videoDetails') or {}).get('title', 'Unknown')
+    duration = int((data.get('videoDetails') or {}).get('lengthSeconds', 0))
+    uploader = (data.get('videoDetails') or {}).get('author', 'Unknown')
+    thumbnail = 'https://img.youtube.com/vi/' + vid + '/hqdefault.jpg'
+    log.info('innertube ok: %s', title)
+    return {
+        'url': stream_url,
+        'title': title,
+        'duration': duration,
+        'thumbnail': thumbnail,
+        'webpage_url': 'https://youtube.com/watch?v=' + vid,
+        'uploader': uploader,
         'query': query,
     }
 
@@ -610,6 +694,7 @@ async def fetch_track(query):
             # Piped first — its servers proxy to YouTube, bypassing GitHub Actions IP block
             for fn, name in [
                 (fetch_via_piped, 'piped'),
+                (fetch_via_innertube, 'innertube'),
                 (fetch_via_pytubefix, 'pytubefix'),
                 (fetch_via_invidious, 'invidious'),
                 (fetch_via_ytdlp_cookies, 'ytdlp+cookies'),
@@ -636,6 +721,7 @@ async def fetch_track(query):
         for fn, name in [
             (fetch_via_soundcloud, 'soundcloud'),
             (fetch_via_piped, 'piped'),
+            (fetch_via_innertube, 'innertube'),
             (fetch_via_pytubefix, 'pytubefix'),
             (fetch_via_invidious, 'invidious'),
             (fetch_via_ytdlp_cookies, 'ytdlp+cookies'),
