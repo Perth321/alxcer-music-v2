@@ -106,9 +106,17 @@ def http_get_json(url, timeout=8, allow_insecure_retry=False):
         'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile',
         'Accept': 'application/json',
     })
+    def _parse(raw):
+        raw = raw.strip()
+        if not raw:
+            raise RuntimeError('empty response from ' + url)
+        try:
+            return json.loads(raw.decode('utf-8', 'ignore'))
+        except Exception:
+            raise RuntimeError('bad JSON from ' + url + ': ' + raw[:80].decode('utf-8', 'ignore'))
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode('utf-8', 'ignore'))
+            return _parse(r.read())
     except urllib.error.URLError as e:
         if not allow_insecure_retry:
             raise
@@ -117,7 +125,7 @@ def http_get_json(url, timeout=8, allow_insecure_retry=False):
             raise
         log.warning('ssl verify failed for %s, retrying without verification', url)
         with urllib.request.urlopen(req, timeout=timeout, context=HTTP_INSECURE_CONTEXT) as r:
-            return json.loads(r.read().decode('utf-8', 'ignore'))
+            return _parse(r.read())
 
 
 def piped_instances():
@@ -503,7 +511,7 @@ def fetch_via_ytdlp(query, cookiefile=None, label='yt-dlp'):
         'extractor_args': {
             'youtube': {
                 # tv_embedded and ios clients bypass bot detection on GitHub Actions IPs
-                'player_client': ['tv_embedded', 'ios', 'mweb'],
+                'player_client': ['tv_embedded', 'web_creator', 'ios', 'mweb', 'mediaconnect'],
                 'player_skip': ['configs'],
             },
         },
@@ -599,6 +607,85 @@ def fetch_via_innertube(query):
     }
 
 
+
+def get_youtube_title_oembed(vid):
+    """Get YouTube title via oEmbed — works on any IP, never blocked."""
+    try:
+        data = http_get_json(
+            'https://www.youtube.com/oembed?url=https://youtube.com/watch?v=' + vid + '&format=json',
+            timeout=8,
+        )
+        return data.get('title', ''), data.get('author_name', '')
+    except Exception as e:
+        log.debug('oembed %s: %s', vid, e)
+        return '', ''
+
+
+def fetch_via_cobalt(query):
+    """cobalt.tools — free proxy on own servers, bypasses GitHub Actions IP block."""
+    q = clean_query(query)
+    vid = extract_video_id(q)
+    if not vid:
+        raise RuntimeError('cobalt: YouTube video ID required')
+    yt_url = 'https://youtube.com/watch?v=' + vid
+    payload = json.dumps({
+        'url': yt_url,
+        'downloadMode': 'audio',
+        'audioFormat': 'best',
+        'filenameStyle': 'basic',
+    }).encode()
+    req = urllib.request.Request(
+        'https://api.cobalt.tools/',
+        data=payload,
+        headers={
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        },
+        method='POST',
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read().decode('utf-8', 'ignore'))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode('utf-8', 'ignore')
+        raise RuntimeError('cobalt HTTP ' + str(e.code) + ': ' + body[:200])
+    status = data.get('status', '')
+    stream_url = data.get('url', '')
+    if status not in ('tunnel', 'redirect', 'stream') or not stream_url:
+        raise RuntimeError('cobalt status=' + status)
+    title, uploader = get_youtube_title_oembed(vid)
+    log.info('cobalt ok: %s', title or vid)
+    return {
+        'url': stream_url,
+        'title': title or vid,
+        'duration': 0,
+        'thumbnail': 'https://img.youtube.com/vi/' + vid + '/hqdefault.jpg',
+        'webpage_url': yt_url,
+        'uploader': uploader or 'YouTube',
+        'query': query,
+        'codec': 'opus',
+    }
+
+
+def fetch_via_yt_to_soundcloud(query):
+    """
+    Last resort: get YouTube title via oEmbed, search SoundCloud.
+    SoundCloud always works from GitHub Actions IPs.
+    """
+    q = clean_query(query)
+    vid = extract_video_id(q)
+    search_q = q
+    if vid:
+        title, uploader = get_youtube_title_oembed(vid)
+        if title:
+            search_q = title + (' ' + uploader if uploader else '')
+            log.info('yt->sc: "%s"', search_q)
+    result = fetch_via_soundcloud(search_q)
+    result['query'] = query
+    return result
+
+
 def fetch_via_ytdlp_direct(query):
     return fetch_via_ytdlp(query, label='yt-dlp')
 
@@ -671,6 +758,7 @@ async def fetch_track(query):
                 search_q, sp_title, sp_thumb = fetch_spotify_info(q)
                 log.info('spotify → %s', search_q)
                 for fn, name in [
+                    (fetch_via_cobalt, 'cobalt'),
                     (fetch_via_piped, 'piped'),
                     (fetch_via_pytubefix, 'pytubefix'),
                     (fetch_via_invidious, 'invidious'),
@@ -691,14 +779,15 @@ async def fetch_track(query):
             raise RuntimeError(' | '.join(errors))
 
         if url_type == 'youtube':
-            # Piped first — its servers proxy to YouTube, bypassing GitHub Actions IP block
             for fn, name in [
+                (fetch_via_cobalt, 'cobalt'),
                 (fetch_via_piped, 'piped'),
                 (fetch_via_innertube, 'innertube'),
                 (fetch_via_pytubefix, 'pytubefix'),
                 (fetch_via_invidious, 'invidious'),
                 (fetch_via_ytdlp_cookies, 'ytdlp+cookies'),
                 (fetch_via_ytdlp_direct, 'yt-dlp'),
+                (fetch_via_yt_to_soundcloud, 'yt->soundcloud'),
             ]:
                 try:
                     return fn(q)
@@ -717,9 +806,10 @@ async def fetch_track(query):
                     errors.append(name + ': ' + str(e))
             raise RuntimeError(' | '.join(errors))
 
-        # Search query: SoundCloud first (always works), then Piped for YouTube
+        # Search: SoundCloud first (always works on GitHub Actions), then YouTube proxies
         for fn, name in [
             (fetch_via_soundcloud, 'soundcloud'),
+            (fetch_via_cobalt, 'cobalt'),
             (fetch_via_piped, 'piped'),
             (fetch_via_innertube, 'innertube'),
             (fetch_via_pytubefix, 'pytubefix'),
