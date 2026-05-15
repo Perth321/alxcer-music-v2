@@ -13,6 +13,7 @@ import json
 import logging
 import shutil
 import sys
+import playlist as pl
 
 logging.basicConfig(
     level=logging.INFO,
@@ -873,14 +874,29 @@ async def play_next(ctx):
 
     now_playing[guild_id] = next_track
 
-    needs_refetch = (mode == 'one') or (mode == 'all' and next_track is current)
+    # Fetch stream URL if missing (playlist tracks come in unresolved) OR
+    # if we're looping the same track (URLs expire).
+    needs_refetch = (
+        not next_track.get('url')
+        or (mode == 'one')
+        or (mode == 'all' and next_track is current)
+    )
     if needs_refetch and next_track.get('query'):
         try:
             fresh = await fetch_track(next_track['query'])
             next_track['url'] = fresh['url']
             next_track['codec'] = fresh.get('codec')
+            if not next_track.get('thumbnail') and fresh.get('thumbnail'):
+                next_track['thumbnail'] = fresh['thumbnail']
+            if not next_track.get('duration') and fresh.get('duration'):
+                next_track['duration'] = fresh['duration']
         except Exception as e:
-            log.warning('re-fetch failed: %s', e)
+            log.warning('re-fetch failed for %r: %s', next_track.get('title'), e)
+            try:
+                await ctx.send('⚠️ ข้าม **' + (next_track.get('title') or '?') + '** (resolve ไม่ได้: ' + str(e)[:120] + ')')
+            except Exception:
+                pass
+            return await play_next(ctx)
 
     try:
         ok = await _start_playback(ctx, next_track)
@@ -899,7 +915,11 @@ async def play_next(ctx):
 @bot.event
 async def on_ready():
     log.info('%s online (id=%s)', bot.user, bot.user.id)
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name='!play'))
+    try:
+        pl.load()
+    except Exception as e:
+        log.warning('playlist load failed: %s', e)
+    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name='!play · !pl help'))
 
 
 @bot.event
@@ -1130,6 +1150,240 @@ async def testaudio(ctx, seconds: int = 8):
     await ctx.send('Playing test tone for ' + str(seconds) + ' seconds.')
 
 
+SOURCE_EMOJI = {'youtube': '▶️', 'soundcloud': '🔶', 'spotify': '🟢',
+                'apple': '🍎', 'manual': '🎵'}
+
+
+def _fmt_track_line(idx, t):
+    src = SOURCE_EMOJI.get(t.get('source', 'manual'), '🎵')
+    title = (t.get('title') or 'Unknown')[:60]
+    uploader = t.get('uploader') or ''
+    extra = ' — ' + uploader[:30] if uploader else ''
+    dur = t.get('duration') or 0
+    dur_s = ' (' + fmt_duration(dur) + ')' if dur else ''
+    return '`' + str(idx).rjust(2) + '` ' + src + ' ' + title + extra + dur_s
+
+
+@bot.group(name='pl', aliases=['playlist'], invoke_without_command=True)
+async def pl_group(ctx, *, name: str = None):
+    """!pl                → ดู playlist ของตัวเอง
+    !pl <ชื่อ>         → ดูเพลงใน playlist
+    !pl help            → คำสั่งทั้งหมด"""
+    if name and name.strip().lower() == 'help':
+        return await pl_help(ctx)
+    if name:
+        return await pl_show(ctx, name=name)
+    plists = pl.get_all(ctx.author.id)
+    if not plists:
+        await ctx.send(
+            '📭 ' + ctx.author.mention + ' ยังไม่มี playlist เลย\n'
+            'สร้างใหม่: `!pl create <ชื่อ>`  หรือ  import: `!pl import <ชื่อ> <link>`\n'
+            'ดูคำสั่งทั้งหมด: `!pl help`'
+        )
+        return
+    embed = discord.Embed(
+        title='📀 Playlist ของ ' + ctx.author.display_name,
+        color=0x5865F2,
+        description='\n'.join(
+            '• **' + p['name'] + '** — ' + str(len(p['tracks'])) + ' เพลง'
+            for p in plists.values()
+        ),
+    )
+    embed.set_footer(text='ดูเพลง: !pl <ชื่อ>  · เล่น: !pl play <ชื่อ>  · เพิ่ม import: !pl import <ชื่อ> <link>')
+    await ctx.send(embed=embed)
+
+
+@pl_group.command(name='help')
+async def pl_help(ctx):
+    embed = discord.Embed(title='📀 คำสั่ง Playlist (ของแต่ละคน)', color=0x5865F2)
+    embed.add_field(
+        name='สร้าง / ลบ',
+        value='`!pl create <ชื่อ>` — สร้าง playlist ใหม่\n'
+              '`!pl delete <ชื่อ>` — ลบ playlist',
+        inline=False,
+    )
+    embed.add_field(
+        name='เพิ่ม / นำเข้าเพลง',
+        value='`!pl import <ชื่อ> <link>` — import จาก Spotify, YouTube, SoundCloud, **Apple Music** (auto-detect)\n'
+              '`!pl add <ชื่อ>` — เพิ่มเพลงที่กำลังเล่นอยู่ลงใน playlist\n'
+              '`!pl remove <ชื่อ> <ลำดับ>` — ลบเพลงตามเลขลำดับ',
+        inline=False,
+    )
+    embed.add_field(
+        name='เล่น / ดู',
+        value='`!pl` — list playlist ทั้งหมดของตัวเอง\n'
+              '`!pl <ชื่อ>` — ดูเพลงใน playlist\n'
+              '`!pl play <ชื่อ>` — โหลดทั้ง playlist เข้าคิว',
+        inline=False,
+    )
+    embed.add_field(
+        name='ส่วนตัวของแต่ละคน',
+        value='Playlist แยกตาม Discord account — คนอื่นเปิดของเขา ของคุณก็ของคุณ ไม่ทับกัน',
+        inline=False,
+    )
+    embed.set_footer(text='รองรับ: 🟢 Spotify · ▶️ YouTube · 🔶 SoundCloud · 🍎 Apple Music')
+    await ctx.send(embed=embed)
+
+
+@pl_group.command(name='create', aliases=['new', 'add_pl'])
+async def pl_create(ctx, *, name: str):
+    ok, res = pl.create(ctx.author.id, name)
+    if ok:
+        await ctx.send('✅ สร้าง playlist **' + res['name'] + '** แล้ว — เพิ่มเพลงด้วย `!pl import` หรือ `!pl add`')
+    else:
+        await ctx.send('❌ ' + res)
+
+
+@pl_group.command(name='delete', aliases=['del', 'rm_pl'])
+async def pl_delete(ctx, *, name: str):
+    ok, err = pl.delete(ctx.author.id, name)
+    if ok:
+        await ctx.send('🗑️ ลบ playlist **' + name + '** แล้ว')
+    else:
+        await ctx.send('❌ ' + err)
+
+
+@pl_group.command(name='show', aliases=['view'])
+async def pl_show(ctx, *, name: str):
+    p = pl.get(ctx.author.id, name)
+    if not p:
+        await ctx.send('❌ ไม่พบ playlist **' + name + '**')
+        return
+    if not p['tracks']:
+        await ctx.send('📭 **' + p['name'] + '** ยังว่าง — `!pl import ' + name + ' <link>` หรือ `!pl add ' + name + '`')
+        return
+    lines = [_fmt_track_line(i + 1, t) for i, t in enumerate(p['tracks'][:25])]
+    if len(p['tracks']) > 25:
+        lines.append('… อีก ' + str(len(p['tracks']) - 25) + ' เพลง')
+    embed = discord.Embed(
+        title='📀 ' + p['name'] + ' — ' + str(len(p['tracks'])) + ' เพลง',
+        description='\n'.join(lines),
+        color=0x5865F2,
+    )
+    embed.set_footer(text='เล่น: !pl play ' + name + '  · ลบเพลง: !pl remove ' + name + ' <ลำดับ>')
+    await ctx.send(embed=embed)
+
+
+@pl_group.command(name='import', aliases=['imp', 'sync'])
+async def pl_import(ctx, name: str, *, url: str):
+    if not pl.detect_import_type(url):
+        await ctx.send(
+            '❌ ไม่รู้จัก link นี้\nรองรับ:\n'
+            '• 🟢 Spotify playlist/album: `https://open.spotify.com/playlist/...`\n'
+            '• ▶️ YouTube playlist: `https://www.youtube.com/playlist?list=...`\n'
+            '• 🔶 SoundCloud set: `https://soundcloud.com/<user>/sets/...`\n'
+            '• 🍎 Apple Music playlist/album: `https://music.apple.com/.../playlist/...`'
+        )
+        return
+
+    msg = await ctx.send('⏳ กำลัง import playlist เข้า **' + name + '** …')
+    loop = asyncio.get_event_loop()
+    try:
+        kind, src_name, tracks = await loop.run_in_executor(
+            None, lambda: pl.import_any(url, piped_instances)
+        )
+    except Exception as e:
+        await msg.edit(content='❌ import ล้มเหลว: ' + str(e)[:300])
+        return
+
+    try:
+        saved = pl.set_tracks(ctx.author.id, name.lower(), name, tracks)
+    except Exception as e:
+        await msg.edit(content='❌ บันทึกไม่ได้: ' + str(e))
+        return
+
+    await msg.edit(
+        content='✅ import จาก **' + kind + '** ("' + (src_name or '?') + '") '
+        'เข้า playlist **' + saved['name'] + '** เรียบร้อย — ' + str(len(saved['tracks'])) + ' เพลง\n'
+        'เล่นเลย: `!pl play ' + name + '`'
+    )
+
+
+@pl_group.command(name='add')
+async def pl_add(ctx, *, name: str):
+    """Add the currently-playing track to a playlist."""
+    cur = now_playing.get(ctx.guild.id)
+    if not cur:
+        await ctx.send('❌ ไม่มีเพลงเล่นอยู่ตอนนี้')
+        return
+    if not pl.get(ctx.author.id, name):
+        ok, _ = pl.create(ctx.author.id, name)
+        if not ok:
+            pass  # might already exist or limit reached, continue trying add
+    ok, res = pl.add_track(ctx.author.id, name, cur)
+    if ok:
+        await ctx.send('✅ เพิ่ม **' + (cur.get('title') or 'เพลง') + '** เข้า **' + name + '** แล้ว')
+    else:
+        await ctx.send('❌ ' + res)
+
+
+@pl_group.command(name='remove', aliases=['rm'])
+async def pl_remove(ctx, name: str, index: int):
+    ok, res = pl.remove_track(ctx.author.id, name, index)
+    if ok:
+        await ctx.send('🗑️ ลบ **' + (res.get('title') or '?') + '** ออกจาก **' + name + '** แล้ว')
+    else:
+        await ctx.send('❌ ' + res)
+
+
+@pl_group.command(name='play')
+async def pl_play(ctx, *, name: str):
+    if not ctx.author.voice:
+        await ctx.send('❌ เข้า voice channel ก่อนนะ!')
+        return
+    p = pl.get(ctx.author.id, name)
+    if not p:
+        await ctx.send('❌ ไม่พบ playlist **' + name + '**')
+        return
+    if not p['tracks']:
+        await ctx.send('❌ playlist ว่างเปล่า')
+        return
+
+    try:
+        await ensure_voice(ctx)
+    except Exception as e:
+        await ctx.send('❌ เข้า voice ไม่ได้: ' + str(e))
+        return
+
+    msg = await ctx.send(
+        '📥 โหลด **' + p['name'] + '** (' + str(len(p['tracks'])) + ' เพลง) เข้าคิว — '
+        'จะ resolve เพลงแรกแล้วเริ่มเล่น เพลงถัดไปจะ resolve อัตโนมัติเมื่อใกล้ถึงคิว'
+    )
+
+    queue = get_queue(ctx.guild.id)
+    enqueued = 0
+
+    # Fetch first track right away so playback starts immediately
+    first_track = pl.track_to_queue_entry(p['tracks'][0])
+    try:
+        fresh = await fetch_track(first_track['query'] or first_track['webpage_url'])
+        first_track.update({k: v for k, v in fresh.items() if v is not None})
+    except Exception as e:
+        log.warning('first-track resolve failed: %s', e)
+        await msg.edit(content='⚠️ เพลงแรกเล่นไม่ได้ (' + str(e)[:120] + ') — ข้ามไปเพลงถัดไป')
+
+    if first_track.get('url'):
+        if not ctx.voice_client or not ctx.voice_client.is_playing():
+            now_playing[ctx.guild.id] = first_track
+            await _start_playback(ctx, first_track)
+            await ctx.send(embed=make_np_embed(first_track, ctx.guild.id), view=PlayerView(ctx))
+        else:
+            queue.append(first_track)
+        enqueued += 1
+
+    # Lazy: rest go in queue with url=None; play_next will fetch via the
+    # track.query when each one comes up (mode-one/all branch already does this
+    # for repeats; we need to also fetch on first play of unresolved tracks).
+    for t in p['tracks'][1:]:
+        queue.append(pl.track_to_queue_entry(t))
+        enqueued += 1
+
+    await msg.edit(
+        content='✅ เพิ่ม **' + p['name'] + '** เข้าคิว ' + str(enqueued) + ' เพลง '
+        '(เพลงที่ยังไม่ resolve จะถูก fetch ตอนถึงคิว)'
+    )
+
+
 @bot.command(name='diag')
 async def diag(ctx):
     vc = ctx.voice_client
@@ -1167,6 +1421,12 @@ async def help_cmd(ctx):
     embed.add_field(name='!clear', value='ล้างคิว', inline=True)
     embed.add_field(name='!leave (!dc)', value='ออก voice', inline=True)
     embed.add_field(name='!reconnect (!rc)', value='เชื่อมใหม่', inline=True)
+    embed.add_field(
+        name='📀 Playlist ส่วนตัว — `!pl help`',
+        value='สร้าง/import playlist ของตัวเอง รองรับ Spotify, YouTube, SoundCloud, **Apple Music**\n'
+              'แต่ละคนมี playlist ของตัวเอง ไม่ทับกัน',
+        inline=False,
+    )
     embed.set_footer(text='ปุ่ม Now Playing: ⏯️ Pause/Resume  ⏭️ Skip  🔁 Loop  ⏹️ Stop')
     await ctx.send(embed=embed)
 
