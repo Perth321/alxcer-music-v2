@@ -12,6 +12,7 @@ import ssl
 import json
 import logging
 import shutil
+import subprocess
 import sys
 import playlist as pl
 
@@ -56,6 +57,8 @@ FFMPEG_BEFORE = (
 )
 FFMPEG_PCM_OPTIONS = '-vn -f s16le -ar 48000 -ac 2'
 COOKIES_FILE = os.path.join(os.path.dirname(__file__), 'cookies.txt')
+STREAM_PREFLIGHT_SECONDS = 1
+STREAM_PREFLIGHT_TIMEOUT = 20
 
 _cookies_env = os.environ.get('YOUTUBE_COOKIES', '')
 if _cookies_env and not os.path.exists(COOKIES_FILE):
@@ -220,6 +223,39 @@ def canonical_youtube_url(query):
     return 'https://www.youtube.com/watch?v=' + vid
 
 
+def preflight_stream(url, label='stream'):
+    if os.environ.get('SKIP_STREAM_PREFLIGHT') == '1':
+        return True
+    cmd = [
+        FFMPEG_EXECUTABLE,
+        '-hide_banner',
+        '-nostdin',
+        '-v', 'error',
+        '-reconnect', '1',
+        '-reconnect_streamed', '1',
+        '-reconnect_on_network_error', '1',
+        '-i', url,
+        '-t', str(STREAM_PREFLIGHT_SECONDS),
+        '-vn',
+        '-f', 'null',
+        '-',
+    ]
+    try:
+        p = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=STREAM_PREFLIGHT_TIMEOUT,
+        )
+    except Exception as e:
+        raise RuntimeError(label + ' preflight failed: ' + str(e))
+    if p.returncode != 0:
+        err = (p.stderr or '').strip().replace('\n', ' ')
+        raise RuntimeError(label + ' preflight rc=' + str(p.returncode) + ': ' + err[-260:])
+    return True
+
+
 _SC_CLIENT_ID = None
 _SC_CLIENT_ID_TS = 0
 
@@ -361,10 +397,25 @@ def fetch_via_piped(query):
             audio = streams.get('audioStreams') or []
             if not audio:
                 raise RuntimeError('no audio streams')
-            opus_audio = [a for a in audio if (a.get('codec') or '').lower() == 'opus']
-            candidates = opus_audio or audio
-            candidates.sort(key=lambda a: a.get('bitrate', 0), reverse=True)
-            best = candidates[0]
+            candidates = list(audio)
+            candidates.sort(
+                key=lambda a: (
+                    0 if (a.get('codec') or '').lower() == 'opus' else 1,
+                    -(a.get('bitrate', 0) or 0),
+                )
+            )
+            best = None
+            last_stream_err = None
+            for cand in candidates[:8]:
+                try:
+                    preflight_stream(cand['url'], label='piped ' + inst)
+                    best = cand
+                    break
+                except Exception as e:
+                    last_stream_err = e
+                    log.warning('piped stream failed %s bitrate=%s: %s', inst, cand.get('bitrate'), e)
+            if not best:
+                raise RuntimeError('all piped streams failed: ' + str(last_stream_err))
             stream_url = best['url']
             codec = (best.get('codec') or '').lower()
             log.info('piped ok via %s codec=%s bitrate=%s', inst, codec, best.get('bitrate'))
@@ -470,41 +521,52 @@ def ytdlp_target(query):
 
 def fetch_via_ytdlp(query, cookiefile=None, label='yt-dlp'):
     """yt-dlp fallback for direct URLs and YouTube searches."""
-    opts = {
-        'format': 'bestaudio[ext=m4a]/bestaudio/best',
+    base_opts = {
         'quiet': True,
         'no_warnings': True,
         'noplaylist': True,
-        'source_address': '0.0.0.0',
         'geo_bypass': True,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android', 'web'],
-            },
-        },
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120',
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.6778.200 Mobile Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
         },
     }
     if cookiefile:
-        opts['cookiefile'] = cookiefile
+        base_opts['cookiefile'] = cookiefile
     target = ytdlp_target(query)
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        data = ydl.extract_info(target, download=False)
-    if 'entries' in data:
-        data = data['entries'][0]
-    if not data.get('url'):
-        raise RuntimeError('no stream url')
-    log.info('%s ok: %s', label, data.get('title'))
-    return {
-        'url': data['url'],
-        'title': data.get('title', 'Unknown'),
-        'duration': data.get('duration', 0),
-        'thumbnail': data.get('thumbnail'),
-        'webpage_url': data.get('webpage_url', target),
-        'uploader': data.get('uploader', 'Unknown'),
-        'query': query,
-    }
+    formats = [
+        'bestaudio[ext=webm]',
+        'bestaudio[ext=m4a]',
+        'bestaudio',
+        'best',
+    ]
+    last_err = None
+    for fmt in formats:
+        opts = dict(base_opts)
+        opts['format'] = fmt
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                data = ydl.extract_info(target, download=False)
+            if 'entries' in data:
+                data = data['entries'][0]
+            if not data.get('url'):
+                raise RuntimeError('no stream url')
+            preflight_stream(data['url'], label=label + ' ' + fmt)
+            log.info('%s ok: %s fmt=%s', label, data.get('title'), fmt)
+            return {
+                'url': data['url'],
+                'title': data.get('title', 'Unknown'),
+                'duration': data.get('duration', 0),
+                'thumbnail': data.get('thumbnail'),
+                'webpage_url': data.get('webpage_url', target),
+                'uploader': data.get('uploader', 'Unknown'),
+                'codec': data.get('acodec'),
+                'query': query,
+            }
+        except Exception as e:
+            last_err = e
+            log.warning('%s failed fmt=%s: %s', label, fmt, e)
+    raise RuntimeError(str(last_err))
 
 
 
@@ -548,6 +610,85 @@ def fetch_via_ytdlp_cookies(query):
     if not os.path.exists(COOKIES_FILE):
         raise RuntimeError('no cookies file, skipping ytdlp')
     return fetch_via_ytdlp(query, cookiefile=COOKIES_FILE, label='ytdlp+cookies')
+
+
+def fetch_via_innertube(query):
+    """Direct YouTube InnerTube API fallback when frontends/proxies fail."""
+    import json as _json
+    query = clean_query(query)
+    vid = extract_video_id(query)
+    if not vid:
+        try:
+            ids = youtube_html_search(query, n=1)
+        except Exception:
+            ids = []
+        if not ids:
+            raise RuntimeError('no video ID for innertube')
+        vid = ids[0]
+
+    payload = _json.dumps({
+        'videoId': vid,
+        'context': {
+            'client': {
+                'clientName': 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
+                'clientVersion': '2.0',
+                'hl': 'en',
+            }
+        }
+    }).encode()
+    req = urllib.request.Request(
+        'https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8',
+        data=payload,
+        headers={
+            'Content-Type': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/6.0 TV Safari/538.1',
+            'X-YouTube-Client-Name': '85',
+            'X-YouTube-Client-Version': '2.0',
+        },
+        method='POST',
+    )
+    with urllib.request.urlopen(req, timeout=12) as r:
+        data = _json.loads(r.read())
+
+    streaming = data.get('streamingData') or {}
+    fmts = streaming.get('adaptiveFormats') or streaming.get('formats') or []
+    audio = [f for f in fmts if f.get('mimeType', '').startswith('audio/')]
+    if not audio:
+        raise RuntimeError('no audio formats from innertube')
+    audio.sort(key=lambda f: f.get('bitrate', 0), reverse=True)
+    best = None
+    best_url = None
+    last_err = None
+    for cand in audio[:6]:
+        stream_url = cand.get('url') or cand.get('signatureCipher')
+        if not stream_url or not stream_url.startswith('http'):
+            last_err = RuntimeError('stream URL requires signature cipher')
+            continue
+        try:
+            preflight_stream(stream_url, label='innertube')
+            best = cand
+            best_url = stream_url
+            break
+        except Exception as e:
+            last_err = e
+            log.warning('innertube stream failed bitrate=%s: %s', cand.get('bitrate'), e)
+    if not best:
+        raise RuntimeError('innertube streams failed: ' + str(last_err))
+    title = (data.get('videoDetails') or {}).get('title', 'Unknown')
+    duration = int((data.get('videoDetails') or {}).get('lengthSeconds', 0))
+    uploader = (data.get('videoDetails') or {}).get('author', 'Unknown')
+    thumbnail = 'https://img.youtube.com/vi/' + vid + '/hqdefault.jpg'
+    log.info('innertube ok: %s', title)
+    return {
+        'url': best_url,
+        'title': title,
+        'duration': duration,
+        'thumbnail': thumbnail,
+        'webpage_url': 'https://youtube.com/watch?v=' + vid,
+        'uploader': uploader,
+        'codec': 'opus' if 'opus' in best.get('mimeType', '') else '',
+        'query': query,
+    }
 
 
 def fetch_spotify_info(url):
@@ -611,11 +752,12 @@ async def fetch_track(query):
                 search_q, sp_title, sp_thumb = fetch_spotify_info(q)
                 log.info('spotify → %s', search_q)
                 for fn, name in [
+                    (fetch_via_innertube, 'innertube'),
+                    (fetch_via_ytdlp_cookies, 'ytdlp+cookies'),
+                    (fetch_via_ytdlp_direct, 'yt-dlp'),
                     (fetch_via_piped, 'piped'),
                     (fetch_via_pytubefix, 'pytubefix'),
                     (fetch_via_invidious, 'invidious'),
-                    (fetch_via_ytdlp_cookies, 'ytdlp+cookies'),
-                    (fetch_via_ytdlp_direct, 'yt-dlp'),
                 ]:
                     try:
                         result = fn(search_q)
@@ -631,13 +773,14 @@ async def fetch_track(query):
             raise RuntimeError(' | '.join(errors))
 
         if url_type == 'youtube':
-            # Piped first — its servers proxy to YouTube, bypassing GitHub Actions IP block
+            # Prefer direct YouTube resolvers, but verify ffmpeg can really open the URL.
             for fn, name in [
+                (fetch_via_innertube, 'innertube'),
+                (fetch_via_ytdlp_cookies, 'ytdlp+cookies'),
+                (fetch_via_ytdlp_direct, 'yt-dlp'),
                 (fetch_via_piped, 'piped'),
                 (fetch_via_pytubefix, 'pytubefix'),
                 (fetch_via_invidious, 'invidious'),
-                (fetch_via_ytdlp_cookies, 'ytdlp+cookies'),
-                (fetch_via_ytdlp_direct, 'yt-dlp'),
                 (fetch_via_yt_to_soundcloud, 'yt->soundcloud'),
             ]:
                 try:
@@ -657,14 +800,15 @@ async def fetch_track(query):
                     errors.append(name + ': ' + str(e))
             raise RuntimeError(' | '.join(errors))
 
-        # Search query: SoundCloud first (always works), then Piped for YouTube
+        # Search query: SoundCloud first, then direct/proxy YouTube resolvers.
         for fn, name in [
             (fetch_via_soundcloud, 'soundcloud'),
+            (fetch_via_innertube, 'innertube'),
+            (fetch_via_ytdlp_cookies, 'ytdlp+cookies'),
+            (fetch_via_ytdlp_direct, 'yt-dlp'),
             (fetch_via_piped, 'piped'),
             (fetch_via_pytubefix, 'pytubefix'),
             (fetch_via_invidious, 'invidious'),
-            (fetch_via_ytdlp_cookies, 'ytdlp+cookies'),
-            (fetch_via_ytdlp_direct, 'yt-dlp'),
         ]:
             try:
                 return fn(q)
