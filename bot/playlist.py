@@ -437,15 +437,24 @@ def import_spotify_playlist(url):
     except Exception as e:
         raise RuntimeError('parse Spotify JSON ไม่ได้: ' + str(e))
 
-    # Walk the nested entity tree looking for trackList
+    # Walk the nested entity tree looking for the most complete trackList.
+    # Spotify embeds may include more than one entity-looking object; the first
+    # one is not always the complete playlist.
     pl_name = None
     track_list = None
+    track_container = None
+    track_list_candidates = []
 
     def walk(node):
-        nonlocal pl_name, track_list
+        nonlocal pl_name
         if isinstance(node, dict):
-            if 'trackList' in node and isinstance(node['trackList'], list) and not track_list:
-                track_list = node['trackList']
+            if 'trackList' in node and isinstance(node['trackList'], list):
+                tracks = [
+                    t for t in node['trackList']
+                    if isinstance(t, dict) and (t.get('title') or t.get('name') or t.get('uri'))
+                ]
+                if tracks:
+                    track_list_candidates.append((len(tracks), node, node['trackList']))
             if 'name' in node and isinstance(node['name'], str) and not pl_name:
                 # First "name" inside an entity-looking dict
                 if any(k in node for k in ('trackList', 'subtitle', 'coverArt', 'type')):
@@ -457,6 +466,12 @@ def import_spotify_playlist(url):
                 walk(v)
 
     walk(next_data)
+    if track_list_candidates:
+        track_list_candidates.sort(key=lambda item: item[0], reverse=True)
+        _, track_container, track_list = track_list_candidates[0]
+        if isinstance(track_container, dict) and track_container.get('name'):
+            pl_name = track_container.get('name')
+        log.info('Spotify trackList candidates: %s', [item[0] for item in track_list_candidates[:5]])
 
     if not track_list:
         raise RuntimeError('Spotify ไม่มีรายชื่อเพลง (อาจเป็น playlist ส่วนตัว)')
