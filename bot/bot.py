@@ -65,7 +65,9 @@ STREAM_PREFLIGHT_TIMEOUT = 8
 FETCH_CACHE_TTL = 600
 FETCH_RACE_TIMEOUT = 18
 FETCH_RACE_WORKERS = 4
+STREAM_URL_TTL = int(os.environ.get('STREAM_URL_TTL', '240'))
 MAX_PIPED_INSTANCES = int(os.environ.get('MAX_PIPED_INSTANCES', '2'))
+PIPED_STREAM_INSTANCES = int(os.environ.get('PIPED_STREAM_INSTANCES', '6'))
 MAX_PIPED_STREAMS = int(os.environ.get('MAX_PIPED_STREAMS', '1'))
 _FETCH_CACHE = {}
 
@@ -135,7 +137,8 @@ def piped_instances():
     if _PIPED_INSTANCES_CACHE and time.time() - _PIPED_INSTANCES_TS < 3600:
         return _PIPED_INSTANCES_CACHE
 
-    instances = list(PIPED_INSTANCES)
+    base_instances = list(PIPED_INSTANCES)
+    instances = []
     try:
         data = http_get_json(PIPED_INSTANCES_URL, timeout=8, allow_insecure_retry=True)
         live = []
@@ -149,6 +152,10 @@ def piped_instances():
                 instances.append(api_url)
     except Exception as e:
         log.warning('could not refresh Piped instances: %s', e)
+
+    for api_url in base_instances:
+        if api_url not in instances:
+            instances.append(api_url)
 
     _PIPED_INSTANCES_CACHE = instances
     _PIPED_INSTANCES_TS = time.time()
@@ -256,6 +263,136 @@ def score_search_result(query, title, uploader=''):
         if term in haystack:
             score += 5 if re.fullmatch(r'[a-z0-9]+', term) else 3
     return score
+
+
+BAD_MUSIC_VARIANTS = (
+    r'\bremix(?:ed)?\b',
+    r'\bbootleg\b',
+    r'\bcover\b',
+    r'\bkaraoke\b',
+    r'\binstrumental\b',
+    r'\blive\b',
+    r'\bacoustic\b',
+    r'\bspecial\s+version\b',
+    r'\bdemo\b',
+    r'\bsped\s*up\b',
+    r'\bspeed\s*up\b',
+    r'\bnightcore\b',
+    r'\bslowed\b',
+    r'\breverb\b',
+    r'\blo-?fi\b',
+    r'\b8d\b',
+    r'\bbass\s*boost(?:ed)?\b',
+    r'\bmashup\b',
+    r'\bchipmunk\b',
+    r'\btiktok\b',
+    r'\bdj\s+(?:remix|edit|version)\b',
+)
+
+NON_SONG_HINTS = (
+    r'\breaction\b',
+    r'\breview\b',
+    r'\btutorial\b',
+    r'\blesson\b',
+    r'\bbehind\s+the\s+scenes\b',
+)
+
+
+def _contains_pattern(text, pattern):
+    return bool(re.search(pattern, text or '', flags=re.I))
+
+
+def unwanted_variant(candidate_text, wanted_text):
+    candidate_text = candidate_text or ''
+    wanted_text = wanted_text or ''
+    for pattern in BAD_MUSIC_VARIANTS:
+        if _contains_pattern(candidate_text, pattern) and not _contains_pattern(wanted_text, pattern):
+            return pattern
+    return ''
+
+
+def music_match_score(expected, title, uploader='', duration=0):
+    wanted_title = expected.get('title') or expected.get('query') or ''
+    wanted_artist = expected.get('uploader') or ''
+    wanted_text = ' '.join(
+        str(v or '') for v in (
+            wanted_title,
+            wanted_artist,
+            expected.get('album'),
+        )
+    )
+    candidate_title = normalize_search_text(title or '').casefold()
+    candidate_all = normalize_search_text((title or '') + ' ' + (uploader or '')).casefold()
+    wanted_norm = normalize_search_text(wanted_text).casefold()
+
+    title_terms = search_terms(wanted_title)
+    artist_terms = search_terms(wanted_artist)
+    score = 0
+
+    if title_terms:
+        matched_title = sum(1 for term in title_terms if term in candidate_title)
+        score += matched_title * 14
+        score -= (len(title_terms) - matched_title) * 18
+        if matched_title == len(title_terms):
+            score += 12
+
+    if artist_terms:
+        matched_artist = sum(1 for term in artist_terms if term in candidate_all)
+        score += matched_artist * 8
+        if matched_artist:
+            score += 6
+
+    if unwanted_variant(candidate_all, wanted_norm):
+        score -= 90
+    for pattern in NON_SONG_HINTS:
+        if _contains_pattern(candidate_all, pattern) and not _contains_pattern(wanted_norm, pattern):
+            score -= 50
+
+    wanted_duration = int(expected.get('duration') or 0)
+    try:
+        duration = int(duration or 0)
+    except Exception:
+        duration = 0
+    if wanted_duration and duration:
+        diff = abs(wanted_duration - duration)
+        if diff <= 3:
+            score += 24
+        elif diff <= 10:
+            score += 18
+        elif diff <= 25:
+            score += 8
+        elif diff > 90:
+            score -= 80
+        elif diff > 45:
+            score -= 25
+
+    official_text = candidate_all
+    if re.search(r'\b(official|vevo)\b', official_text, flags=re.I):
+        score += 10
+    if re.search(r'\btopic\b', official_text, flags=re.I) or ' - topic' in official_text:
+        score += 14
+    if re.search(r'\bofficial\s+(audio|music\s+video|mv)\b', official_text, flags=re.I):
+        score += 12
+    return score
+
+
+def acceptable_music_match(expected, candidate):
+    title_terms = search_terms(expected.get('title') or expected.get('query') or '')
+    title = candidate.get('title') or ''
+    uploader = candidate.get('uploader') or candidate.get('uploaderName') or ''
+    duration = candidate.get('duration') or 0
+    score = music_match_score(expected, title, uploader, duration)
+    candidate_all = normalize_search_text(title + ' ' + uploader).casefold()
+    wanted_all = normalize_search_text(
+        (expected.get('title') or '') + ' ' + (expected.get('uploader') or '')
+    ).casefold()
+    if unwanted_variant(candidate_all, wanted_all):
+        return False, score
+    if title_terms:
+        candidate_title = normalize_search_text(title).casefold()
+        if not any(term in candidate_title for term in title_terms):
+            return False, score
+    return score >= 26, score
 
 
 def _is_video_id(value):
@@ -532,6 +669,185 @@ def youtube_html_search(query, n=5):
     return out
 
 
+def add_youtube_candidate(out, seen, video_id=None, url=None, title='', uploader='', duration=0, source=''):
+    video_id = video_id or extract_video_id(url or '')
+    if not video_id or video_id in seen:
+        return
+    seen.add(video_id)
+    out.append({
+        'video_id': video_id,
+        'webpage_url': 'https://www.youtube.com/watch?v=' + video_id,
+        'title': title or 'YouTube result',
+        'uploader': uploader or '',
+        'duration': duration or 0,
+        'source': source,
+    })
+
+
+def youtube_music_search_candidates(query, limit=8):
+    query = clean_query(query)
+    out = []
+    seen = set()
+
+    for inst in piped_instances()[:max(MAX_PIPED_INSTANCES, 4)]:
+        try:
+            data = http_get_json(
+                inst + '/search?q=' + urllib.parse.quote(query) + '&filter=videos',
+                timeout=8,
+                allow_insecure_retry=True,
+            )
+            items = data.get('items') if isinstance(data, dict) else []
+            for item in items or []:
+                if item.get('type') not in ('stream', 'video'):
+                    continue
+                add_youtube_candidate(
+                    out,
+                    seen,
+                    url=item.get('url') or item.get('webpageUrl') or '',
+                    title=item.get('title') or '',
+                    uploader=item.get('uploaderName') or item.get('uploader') or '',
+                    duration=item.get('duration') or 0,
+                    source='piped-search',
+                )
+                if len(out) >= limit:
+                    return out
+        except Exception as e:
+            log.debug('piped music search %s: %s', inst, e)
+
+    try:
+        opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': 'in_playlist',
+            'skip_download': True,
+            'source_address': '0.0.0.0',
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            data = ydl.extract_info('ytsearch' + str(limit) + ':' + query, download=False)
+        for entry in (data.get('entries') or []):
+            if not entry:
+                continue
+            add_youtube_candidate(
+                out,
+                seen,
+                video_id=entry.get('id'),
+                url=entry.get('url') or entry.get('webpage_url') or '',
+                title=entry.get('title') or '',
+                uploader=entry.get('uploader') or entry.get('channel') or '',
+                duration=entry.get('duration') or 0,
+                source='ytsearch',
+            )
+            if len(out) >= limit:
+                return out
+    except Exception as e:
+        log.debug('yt-dlp music search: %s', e)
+
+    try:
+        for video_id in youtube_html_search(query, n=limit):
+            add_youtube_candidate(out, seen, video_id=video_id, source='youtube-html')
+            if len(out) >= limit:
+                return out
+    except Exception as e:
+        log.debug('youtube html music search: %s', e)
+    return out
+
+
+def strict_music_queries(track):
+    title = normalize_search_text(track.get('title') or '')
+    artist = normalize_search_text(track.get('uploader') or '')
+    base = (title + ' ' + artist).strip() or (track.get('query') or '')
+    queries = [
+        base + ' official audio',
+        base + ' official',
+        base + ' topic',
+        base,
+    ]
+    if title and artist:
+        queries.append('"' + title + '" "' + artist + '"')
+    seen = set()
+    out = []
+    for query in queries:
+        query = re.sub(r'\s+', ' ', query).strip()
+        key = query.casefold()
+        if query and key not in seen:
+            seen.add(key)
+            out.append(query)
+    return out
+
+
+def track_cache_key(track):
+    if track.get('source_uri'):
+        return 'music:' + str(track.get('source')) + ':' + str(track.get('source_uri'))
+    return 'music:' + '|'.join(str(track.get(k) or '') for k in ('source', 'title', 'uploader', 'duration'))
+
+
+def fetch_youtube_candidate(candidate, original_query):
+    errors = []
+    url = candidate['webpage_url']
+    providers = [
+        (fetch_via_piped, 'piped'),
+        (fetch_via_innertube, 'innertube'),
+        (fetch_via_ytdlp_cookies, 'ytdlp+cookies'),
+        (fetch_via_ytdlp_direct, 'yt-dlp'),
+    ]
+    for fn, name in providers:
+        try:
+            result = fn(url)
+            result['query'] = original_query
+            return result
+        except Exception as e:
+            errors.append(name + ': ' + str(e))
+    raise RuntimeError('candidate stream failed: ' + ' | '.join(errors[-3:]))
+
+
+def fetch_strict_music_track(track):
+    cache_key = track_cache_key(track)
+    cached = _cached_track(cache_key)
+    if cached:
+        return cached
+
+    original_query = track.get('query') or ((track.get('title') or '') + ' ' + (track.get('uploader') or '')).strip()
+    candidates = []
+    seen = set()
+    errors = []
+    for query in strict_music_queries(track):
+        try:
+            for candidate in youtube_music_search_candidates(query, limit=8):
+                video_id = candidate.get('video_id')
+                if video_id and video_id not in seen:
+                    seen.add(video_id)
+                    candidates.append(candidate)
+        except Exception as e:
+            errors.append(query + ': ' + str(e))
+
+    scored = []
+    for candidate in candidates:
+        ok, score = acceptable_music_match(track, candidate)
+        candidate['match_score'] = score
+        if ok:
+            scored.append(candidate)
+    scored.sort(key=lambda c: c.get('match_score', 0), reverse=True)
+    log.info(
+        'strict music candidates for %s: %s',
+        track.get('title'),
+        [(c.get('match_score'), c.get('title'), c.get('uploader')) for c in scored[:4]],
+    )
+
+    for candidate in scored[:5]:
+        try:
+            result = fetch_youtube_candidate(candidate, original_query)
+            ok, score = acceptable_music_match(track, result)
+            if not ok:
+                raise RuntimeError('resolved mismatch score=' + str(score) + ' title=' + str(result.get('title')))
+            result['resolved_match_score'] = score
+            return _remember_track(cache_key, result)
+        except Exception as e:
+            errors.append((candidate.get('title') or '?') + ': ' + str(e))
+            log.warning('strict candidate failed %s: %s', candidate.get('webpage_url'), e)
+
+    raise RuntimeError('no official/original match: ' + ' | '.join(errors[-4:]))
+
+
 def fetch_via_piped(query):
     """
     Piped API — Piped's own servers fetch from YouTube, so GitHub Actions IP
@@ -547,7 +863,7 @@ def fetch_via_piped(query):
             ids = []
         if not ids:
             # Try Piped search API
-            for inst in piped_instances()[:MAX_PIPED_INSTANCES]:
+            for inst in piped_instances()[:max(MAX_PIPED_INSTANCES, 4)]:
                 try:
                     results = http_get_json(
                         inst + '/search?q=' + urllib.parse.quote(query) + '&filter=videos',
@@ -566,7 +882,7 @@ def fetch_via_piped(query):
         vid = ids[0]
 
     last_err = None
-    for inst in piped_instances()[:MAX_PIPED_INSTANCES]:
+    for inst in piped_instances()[:PIPED_STREAM_INSTANCES]:
         try:
             streams = http_get_json(inst + '/streams/' + vid, timeout=10, allow_insecure_retry=True)
             audio = streams.get('audioStreams') or []
@@ -936,15 +1252,17 @@ async def fetch_track(query):
             try:
                 search_q, sp_title, sp_thumb = fetch_spotify_info(q)
                 log.info('spotify → %s', search_q)
-                providers = [
-                    (fetch_via_ytdlp_direct, 'yt-dlp'),
-                    (fetch_via_soundcloud, 'soundcloud'),
-                    (fetch_via_piped, 'piped'),
-                    (fetch_via_innertube, 'innertube'),
-                    (fetch_via_ytdlp_cookies, 'ytdlp+cookies'),
-                ]
+                sp_artist = search_q.replace(sp_title, '', 1).strip()
+                sp_track = {
+                    'title': sp_title,
+                    'uploader': sp_artist,
+                    'thumbnail': sp_thumb,
+                    'webpage_url': q,
+                    'source': 'spotify',
+                    'query': search_q,
+                }
                 try:
-                    result = run_provider_race(search_q, providers)
+                    result = fetch_strict_music_track(sp_track)
                 except Exception as e:
                     errors.append(str(e))
                     result = run_provider_race(search_q, [
@@ -1283,27 +1601,25 @@ async def play_next(ctx):
     now_playing[guild_id] = next_track
 
     # Fetch stream URL if missing (playlist tracks come in unresolved) OR
-    # if we're looping the same track (URLs expire).
+    # if the resolved URL is stale (playlist loop URLs can expire).
+    resolved_at = float(next_track.get('resolved_at') or 0)
+    url_is_stale = bool(resolved_at and time.time() - resolved_at > STREAM_URL_TTL)
     needs_refetch = (
         not next_track.get('url')
         or (mode == 'one')
         or (mode == 'all' and next_track is current)
+        or url_is_stale
     )
-    if needs_refetch and next_track.get('query'):
+    if needs_refetch and track_play_query(next_track):
         try:
-            fresh = await fetch_track(next_track['query'])
-            next_track['url'] = fresh['url']
-            next_track['codec'] = fresh.get('codec')
-            if not next_track.get('thumbnail') and fresh.get('thumbnail'):
-                next_track['thumbnail'] = fresh['thumbnail']
-            if not next_track.get('duration') and fresh.get('duration'):
-                next_track['duration'] = fresh['duration']
+            await resolve_track_audio(next_track)
         except Exception as e:
             log.warning('re-fetch failed for %r: %s', next_track.get('title'), e)
             try:
                 await ctx.send('⚠️ ข้าม **' + (next_track.get('title') or '?') + '** (resolve ไม่ได้: ' + str(e)[:120] + ')')
             except Exception:
                 pass
+            now_playing.pop(guild_id, None)
             return await play_next(ctx)
 
     try:
@@ -1594,7 +1910,28 @@ def merge_resolved_audio(track, fresh):
         track['thumbnail'] = fresh['thumbnail']
     track['resolved_title'] = fresh.get('title')
     track['resolved_webpage_url'] = fresh.get('webpage_url')
+    track['resolved_at'] = time.time()
+    if fresh.get('resolved_match_score') is not None:
+        track['resolved_match_score'] = fresh.get('resolved_match_score')
     return track
+
+
+def track_play_query(track):
+    return (
+        track.get('query')
+        or track.get('webpage_url')
+        or ((track.get('title') or '') + ' ' + (track.get('uploader') or '')).strip()
+        or track.get('title')
+    )
+
+
+async def resolve_track_audio(track):
+    if track.get('source') in ('spotify', 'apple'):
+        loop = asyncio.get_event_loop()
+        fresh = await loop.run_in_executor(None, lambda: fetch_strict_music_track(track))
+    else:
+        fresh = await fetch_track(track_play_query(track))
+    return merge_resolved_audio(track, fresh)
 
 
 def _playlist_items(user_id):
@@ -1661,7 +1998,7 @@ def _playlist_tracks_embed(ctx, playlist_name, page=0):
             if t.get('thumbnail'):
                 embed.set_thumbnail(url=t['thumbnail'])
                 break
-    embed.set_footer(text='หน้า ' + str(page + 1) + '/' + str(total_pages) + ' • เลือกเพลงจากเมนูเพื่อเล่นทันที')
+    embed.set_footer(text='หน้า ' + str(page + 1) + '/' + str(total_pages) + ' • เลือกเพลง = loop playlist จากเพลงนั้น')
     return embed
 
 
@@ -1673,14 +2010,18 @@ async def play_playlist_track_now(ctx, member, playlist_name, index):
     if not (0 <= index < len(tracks)):
         raise RuntimeError('ไม่พบเพลงลำดับนี้')
     vc = await ensure_voice_for_member(ctx, member)
-    track = pl.track_to_queue_entry(tracks[index])
-    fresh = await fetch_track(track.get('query') or track.get('webpage_url') or track.get('title'))
-    merge_resolved_audio(track, fresh)
+    entries = [pl.track_to_queue_entry(t) for t in tracks]
+    track = entries[index]
     guild_id = ctx.guild.id
+    queue = get_queue(guild_id)
+    queue.clear()
+    queue.extend(entries[index + 1:] + entries[:index])
+    set_loop(guild_id, 'all')
     if vc.is_playing() or vc.is_paused():
         skip_auto_next.add(guild_id)
         vc.stop()
         await asyncio.sleep(0.25)
+    await resolve_track_audio(track)
     now_playing[guild_id] = track
     ok = await _start_playback(ctx, track)
     if not ok:
@@ -1711,8 +2052,7 @@ async def queue_playlist_from_ui(ctx, member, playlist_name, loop_playlist=False
         return None, len(entries), p.get('name', playlist_name)
 
     first = entries[0]
-    fresh = await fetch_track(first.get('query') or first.get('webpage_url') or first.get('title'))
-    merge_resolved_audio(first, fresh)
+    await resolve_track_audio(first)
     now_playing[ctx.guild.id] = first
     ok = await _start_playback(ctx, first)
     if not ok:
@@ -1774,7 +2114,7 @@ class PlaylistTrackSelect(discord.ui.Select):
             await i.followup.send('❌ เล่นเพลงไม่ได้: ' + str(e)[:250], ephemeral=True)
             return
         await self.owner.ctx.send(embed=make_np_embed(track, self.owner.ctx.guild.id), view=PlayerView(self.owner.ctx))
-        await i.followup.send('▶️ เริ่มเล่น **' + _clip(track.get('title'), 80) + '**', ephemeral=True)
+        await i.followup.send('🔁 เริ่ม loop playlist จาก **' + _clip(track.get('title'), 80) + '**', ephemeral=True)
 
 
 class PlaylistBrowserView(discord.ui.View):
@@ -2058,8 +2398,7 @@ async def pl_play(ctx, *, name: str):
     # Fetch first track right away so playback starts immediately
     first_track = pl.track_to_queue_entry(p['tracks'][0])
     try:
-        fresh = await fetch_track(first_track['query'] or first_track['webpage_url'])
-        merge_resolved_audio(first_track, fresh)
+        await resolve_track_audio(first_track)
     except Exception as e:
         log.warning('first-track resolve failed: %s', e)
         await msg.edit(content='⚠️ เพลงแรกเล่นไม่ได้ (' + str(e)[:120] + ') — ข้ามไปเพลงถัดไป')
