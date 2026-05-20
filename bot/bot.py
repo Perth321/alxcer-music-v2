@@ -2183,15 +2183,17 @@ class PlaylistTracksView(discord.ui.View):
     async def play_all_btn(self, i: discord.Interaction, b):
         await i.response.defer(ephemeral=True, thinking=True)
         try:
-            first, count, name = await queue_playlist_from_ui(self.ctx, i.user, self.playlist_name)
+            first, count, name = await queue_playlist_from_ui(
+                self.ctx, i.user, self.playlist_name, loop_playlist=True
+            )
         except Exception as e:
             await i.followup.send('❌ เล่น playlist ไม่ได้: ' + str(e)[:250], ephemeral=True)
             return
         if first:
             await self.ctx.send(embed=make_np_embed(first, self.ctx.guild.id), view=PlayerView(self.ctx))
-            await i.followup.send('▶️ เริ่มเล่น **' + name + '** และเพิ่มเข้าคิว ' + str(count) + ' เพลง', ephemeral=True)
+            await i.followup.send('🔁 เริ่ม loop **' + name + '** ทั้งหมด ' + str(count) + ' เพลง', ephemeral=True)
         else:
-            await i.followup.send('✅ เพิ่ม **' + name + '** เข้าคิว ' + str(count) + ' เพลง', ephemeral=True)
+            await i.followup.send('🔁 Loop **' + name + '** แล้ว — ' + str(count) + ' เพลง', ephemeral=True)
 
     @discord.ui.button(emoji='🔁', label='Loop Playlist', style=discord.ButtonStyle.primary, row=2)
     async def loop_playlist_btn(self, i: discord.Interaction, b):
