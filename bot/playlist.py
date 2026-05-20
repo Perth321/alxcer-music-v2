@@ -17,6 +17,7 @@ import urllib.error
 import urllib.parse
 import logging
 import threading
+import concurrent.futures
 
 log = logging.getLogger('alxcer.playlist')
 
@@ -26,6 +27,8 @@ GITHUB_REPO = 'Perth321/alxcer-music-v2'
 PLAYLISTS_PATH = 'bot/playlists.json'
 MAX_TRACKS = 500
 MAX_PLAYLISTS = 20
+SPOTIFY_ENRICH_LIMIT = int(os.environ.get('SPOTIFY_ENRICH_LIMIT', '100'))
+SPOTIFY_ENRICH_WORKERS = int(os.environ.get('SPOTIFY_ENRICH_WORKERS', '8'))
 
 _data = {'playlists': {}}
 _sha = None
@@ -172,6 +175,13 @@ def add_track(user_id, name, track):
         'thumbnail': track.get('thumbnail'),
         'source': track.get('source', 'manual'),
         'query': track.get('query') or track.get('webpage_url', '') or track.get('title', ''),
+        'album': track.get('album', ''),
+        'added_at': track.get('added_at', ''),
+        'release_date': track.get('release_date', ''),
+        'source_position': track.get('source_position', 0),
+        'source_uri': track.get('source_uri', ''),
+        'preview_url': track.get('preview_url', ''),
+        'explicit': bool(track.get('explicit')),
     }
     pl['tracks'].append(entry)
     _save_async()
@@ -213,6 +223,13 @@ def track_to_queue_entry(t):
         'thumbnail': t.get('thumbnail'),
         'source': t.get('source', 'manual'),
         'query': t.get('query') or t.get('webpage_url', '') or t.get('title', ''),
+        'album': t.get('album', ''),
+        'added_at': t.get('added_at', ''),
+        'release_date': t.get('release_date', ''),
+        'source_position': t.get('source_position', 0),
+        'source_uri': t.get('source_uri', ''),
+        'preview_url': t.get('preview_url', ''),
+        'explicit': bool(t.get('explicit')),
         'url': None,
     }
 
@@ -334,6 +351,72 @@ def _spotify_resource_id(url):
     return m.group(1), m.group(2)
 
 
+def _best_spotify_image(images):
+    if not isinstance(images, list) or not images:
+        return None
+    best = None
+    best_size = -1
+    for img in images:
+        if not isinstance(img, dict):
+            continue
+        url = img.get('url')
+        if not url:
+            continue
+        size = int(img.get('maxWidth') or img.get('width') or img.get('maxHeight') or img.get('height') or 0)
+        if best is None or size > best_size:
+            best = url
+            best_size = size
+    return best
+
+
+def _spotify_track_embed_details(track_id):
+    if not track_id:
+        return {}
+    try:
+        html = _http_get('https://open.spotify.com/embed/track/' + track_id, timeout=8)
+        m = re.search(
+            r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.+?)</script>',
+            html, re.DOTALL,
+        )
+        if not m:
+            return {}
+        next_data = json.loads(m.group(1))
+    except Exception as e:
+        log.debug('Spotify track detail %s failed: %s', track_id, e)
+        return {}
+
+    track_node = None
+
+    def walk(node):
+        nonlocal track_node
+        if track_node is not None:
+            return
+        if isinstance(node, dict):
+            if node.get('type') == 'track' and (node.get('id') == track_id or node.get('uri', '').endswith(track_id)):
+                track_node = node
+                return
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(next_data)
+    if not track_node:
+        return {}
+
+    visual = track_node.get('visualIdentity') or {}
+    artists = track_node.get('artists') or []
+    release = track_node.get('releaseDate') or {}
+    preview = track_node.get('audioPreview') or {}
+    return {
+        'thumbnail': _best_spotify_image(visual.get('image')),
+        'release_date': release.get('isoString', ''),
+        'uploader': ', '.join(a.get('name', '') for a in artists if isinstance(a, dict) and a.get('name')),
+        'preview_url': preview.get('url', ''),
+    }
+
+
 def import_spotify_playlist(url):
     """Scrape Spotify embed page (no API key). Returns tracks with title+artist
     as `query` so the bot resolves them via YouTube/SoundCloud at play time."""
@@ -378,8 +461,26 @@ def import_spotify_playlist(url):
     if not track_list:
         raise RuntimeError('Spotify ไม่มีรายชื่อเพลง (อาจเป็น playlist ส่วนตัว)')
 
+    detail_map = {}
+    ids_to_enrich = []
+    for t in track_list[:SPOTIFY_ENRICH_LIMIT]:
+        uri = t.get('uri', '')
+        sp_track_id = uri.split(':')[-1] if uri else ''
+        if sp_track_id:
+            ids_to_enrich.append(sp_track_id)
+
+    if ids_to_enrich:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, SPOTIFY_ENRICH_WORKERS)) as executor:
+            futures = {executor.submit(_spotify_track_embed_details, track_id): track_id for track_id in ids_to_enrich}
+            for future in concurrent.futures.as_completed(futures):
+                track_id = futures[future]
+                try:
+                    detail_map[track_id] = future.result()
+                except Exception:
+                    detail_map[track_id] = {}
+
     tracks = []
-    for t in track_list:
+    for idx, t in enumerate(track_list, 1):
         title = t.get('title') or t.get('name') or 'Unknown'
         artists = t.get('subtitle') or ''
         if isinstance(artists, list):
@@ -387,6 +488,9 @@ def import_spotify_playlist(url):
         artists = str(artists).strip()
         uri = t.get('uri', '')
         sp_track_id = uri.split(':')[-1] if uri else ''
+        detail = detail_map.get(sp_track_id) or {}
+        if detail.get('uploader'):
+            artists = detail['uploader']
         webpage = ('https://open.spotify.com/track/' + sp_track_id) if sp_track_id else url
         search_q = (title + ' ' + artists).strip()
         dur_ms = t.get('duration') or t.get('duration_ms') or 0
@@ -399,9 +503,16 @@ def import_spotify_playlist(url):
             'webpage_url': webpage,
             'duration': dur_s,
             'uploader': artists,
-            'thumbnail': None,
+            'thumbnail': detail.get('thumbnail'),
             'source': 'spotify',
             'query': search_q,
+            'album': t.get('album') or t.get('albumName') or '',
+            'added_at': t.get('addedAt') or t.get('added_at') or '',
+            'release_date': detail.get('release_date', ''),
+            'source_position': idx,
+            'source_uri': uri,
+            'preview_url': detail.get('preview_url', ''),
+            'explicit': bool(t.get('isExplicit')),
         })
 
     if not tracks:

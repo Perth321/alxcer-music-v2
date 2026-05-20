@@ -1061,6 +1061,10 @@ def make_np_embed(track, guild_id=None):
     )
     embed.add_field(name='⏱ ความยาว', value=fmt_duration(track['duration']), inline=True)
     embed.add_field(name='🎤 ช่อง', value=track['uploader'], inline=True)
+    if track.get('album'):
+        embed.add_field(name='💿 Album', value=_clip(track.get('album'), 80), inline=True)
+    elif track.get('release_date'):
+        embed.add_field(name='📅 Release', value=_fmt_source_date(track.get('release_date')), inline=True)
     if guild_id is not None:
         embed.add_field(name='🔁 Loop', value=LOOP_LABELS[get_loop(guild_id)], inline=True)
     if track.get('thumbnail'):
@@ -1574,6 +1578,25 @@ def _clip(value, limit):
     return value if len(value) <= limit else value[:max(0, limit - 1)] + '…'
 
 
+def _fmt_source_date(value):
+    value = str(value or '').strip()
+    if not value:
+        return ''
+    return value[:10]
+
+
+def merge_resolved_audio(track, fresh):
+    track['url'] = fresh['url']
+    track['codec'] = fresh.get('codec')
+    if not track.get('duration') and fresh.get('duration'):
+        track['duration'] = fresh['duration']
+    if not track.get('thumbnail') and fresh.get('thumbnail'):
+        track['thumbnail'] = fresh['thumbnail']
+    track['resolved_title'] = fresh.get('title')
+    track['resolved_webpage_url'] = fresh.get('webpage_url')
+    return track
+
+
 def _playlist_items(user_id):
     return sorted(
         pl.get_all(user_id).items(),
@@ -1582,12 +1605,20 @@ def _playlist_items(user_id):
 
 
 def _track_line(idx, t, selected=False):
-    marker = '▶' if selected else str(idx).rjust(2)
+    marker = '▶' if selected else str(t.get('source_position') or idx).rjust(2)
     src = SOURCE_EMOJI.get(t.get('source', 'manual'), '🎵')
     title = _clip(t.get('title') or 'Unknown', 56)
     uploader = _clip(t.get('uploader') or 'Unknown', 34)
     dur = fmt_duration(t.get('duration') or 0) if t.get('duration') else '--:--'
-    return '`' + marker + '` ' + src + ' **' + title + '**\n    ' + uploader + ' • `' + dur + '`'
+    album = _clip(t.get('album') or '', 30)
+    date = _fmt_source_date(t.get('added_at') or t.get('release_date'))
+    meta = [uploader]
+    if album:
+        meta.append(album)
+    if date:
+        meta.append(date)
+    meta.append('`' + dur + '`')
+    return '`' + marker + '` ' + src + ' **' + title + '**\n    ' + ' • '.join(meta)
 
 
 def _playlist_browser_embed(ctx):
@@ -1626,6 +1657,10 @@ def _playlist_tracks_embed(ctx, playlist_name, page=0):
         embed.description = 'playlist นี้ยังว่าง กด **Spotify Sync** หรือใช้ `!pl import ' + p.get('name', playlist_name) + ' <link>`'
     else:
         embed.description = '\n'.join(_track_line(start + i + 1, t) for i, t in enumerate(page_tracks))
+        for t in page_tracks:
+            if t.get('thumbnail'):
+                embed.set_thumbnail(url=t['thumbnail'])
+                break
     embed.set_footer(text='หน้า ' + str(page + 1) + '/' + str(total_pages) + ' • เลือกเพลงจากเมนูเพื่อเล่นทันที')
     return embed
 
@@ -1640,7 +1675,7 @@ async def play_playlist_track_now(ctx, member, playlist_name, index):
     vc = await ensure_voice_for_member(ctx, member)
     track = pl.track_to_queue_entry(tracks[index])
     fresh = await fetch_track(track.get('query') or track.get('webpage_url') or track.get('title'))
-    track.update({k: v for k, v in fresh.items() if v is not None})
+    merge_resolved_audio(track, fresh)
     guild_id = ctx.guild.id
     if vc.is_playing() or vc.is_paused():
         skip_auto_next.add(guild_id)
@@ -1669,7 +1704,7 @@ async def queue_playlist_from_ui(ctx, member, playlist_name):
 
     first = entries[0]
     fresh = await fetch_track(first.get('query') or first.get('webpage_url') or first.get('title'))
-    first.update({k: v for k, v in fresh.items() if v is not None})
+    merge_resolved_audio(first, fresh)
     now_playing[ctx.guild.id] = first
     ok = await _start_playback(ctx, first)
     if not ok:
@@ -1706,7 +1741,14 @@ class PlaylistTrackSelect(discord.ui.Select):
         options = []
         for abs_idx, t in enumerate(tracks[start:start + PLAYLIST_PAGE_SIZE], start):
             title = _clip(str(abs_idx + 1) + '. ' + (t.get('title') or 'Unknown'), 100)
-            desc = _clip((t.get('uploader') or 'Unknown') + ' • ' + (fmt_duration(t.get('duration') or 0) if t.get('duration') else '--:--'), 100)
+            bits = [t.get('uploader') or 'Unknown']
+            if t.get('album'):
+                bits.append(t.get('album'))
+            date = _fmt_source_date(t.get('added_at') or t.get('release_date'))
+            if date:
+                bits.append(date)
+            bits.append(fmt_duration(t.get('duration') or 0) if t.get('duration') else '--:--')
+            desc = _clip(' • '.join(bits), 100)
             options.append(discord.SelectOption(
                 label=title,
                 description=desc,
@@ -1974,7 +2016,7 @@ async def pl_play(ctx, *, name: str):
     first_track = pl.track_to_queue_entry(p['tracks'][0])
     try:
         fresh = await fetch_track(first_track['query'] or first_track['webpage_url'])
-        first_track.update({k: v for k, v in fresh.items() if v is not None})
+        merge_resolved_audio(first_track, fresh)
     except Exception as e:
         log.warning('first-track resolve failed: %s', e)
         await msg.edit(content='⚠️ เพลงแรกเล่นไม่ได้ (' + str(e)[:120] + ') — ข้ามไปเพลงถัดไป')
