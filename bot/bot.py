@@ -15,6 +15,8 @@ import shutil
 import subprocess
 import sys
 import importlib.util
+import concurrent.futures
+import time
 import playlist as pl
 
 logging.basicConfig(
@@ -59,7 +61,13 @@ FFMPEG_BEFORE = (
 FFMPEG_PCM_OPTIONS = '-vn -f s16le -ar 48000 -ac 2'
 COOKIES_FILE = os.path.join(os.path.dirname(__file__), 'cookies.txt')
 STREAM_PREFLIGHT_SECONDS = 1
-STREAM_PREFLIGHT_TIMEOUT = 20
+STREAM_PREFLIGHT_TIMEOUT = 8
+FETCH_CACHE_TTL = 600
+FETCH_RACE_TIMEOUT = 18
+FETCH_RACE_WORKERS = 4
+MAX_PIPED_INSTANCES = int(os.environ.get('MAX_PIPED_INSTANCES', '2'))
+MAX_PIPED_STREAMS = int(os.environ.get('MAX_PIPED_STREAMS', '1'))
+_FETCH_CACHE = {}
 
 _cookies_env = os.environ.get('YOUTUBE_COOKIES', '')
 if _cookies_env and not os.path.exists(COOKIES_FILE):
@@ -317,6 +325,55 @@ def canonical_youtube_url(query):
     return 'https://www.youtube.com/watch?v=' + vid
 
 
+def _cache_key(query):
+    return clean_query(query).casefold()
+
+
+def _cached_track(query):
+    item = _FETCH_CACHE.get(_cache_key(query))
+    if not item:
+        return None
+    ts, track = item
+    if time.time() - ts > FETCH_CACHE_TTL:
+        _FETCH_CACHE.pop(_cache_key(query), None)
+        return None
+    cached = dict(track)
+    log.info('fetch cache hit: %s', clean_query(query)[:80])
+    return cached
+
+
+def _remember_track(query, track):
+    if track and track.get('url'):
+        _FETCH_CACHE[_cache_key(query)] = (time.time(), dict(track))
+    return track
+
+
+def run_provider_race(query, providers, timeout=FETCH_RACE_TIMEOUT):
+    if not providers:
+        raise RuntimeError('no providers configured')
+    errors = []
+    max_workers = min(FETCH_RACE_WORKERS, len(providers))
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+    futures = {executor.submit(fn, query): name for fn, name in providers}
+    try:
+        try:
+            for future in concurrent.futures.as_completed(futures, timeout=timeout):
+                name = futures[future]
+                try:
+                    result = future.result()
+                    log.info('resolver won: %s', name)
+                    return result
+                except Exception as e:
+                    errors.append(name + ': ' + str(e))
+        except concurrent.futures.TimeoutError:
+            pending = [name for future, name in futures.items() if not future.done()]
+            if pending:
+                errors.append('timeout waiting for: ' + ', '.join(pending))
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+    raise RuntimeError(' | '.join(errors))
+
+
 def preflight_stream(url, label='stream'):
     if os.environ.get('SKIP_STREAM_PREFLIGHT') == '1':
         return True
@@ -490,7 +547,7 @@ def fetch_via_piped(query):
             ids = []
         if not ids:
             # Try Piped search API
-            for inst in piped_instances()[:5]:
+            for inst in piped_instances()[:MAX_PIPED_INSTANCES]:
                 try:
                     results = http_get_json(
                         inst + '/search?q=' + urllib.parse.quote(query) + '&filter=videos',
@@ -509,7 +566,7 @@ def fetch_via_piped(query):
         vid = ids[0]
 
     last_err = None
-    for inst in piped_instances():
+    for inst in piped_instances()[:MAX_PIPED_INSTANCES]:
         try:
             streams = http_get_json(inst + '/streams/' + vid, timeout=10, allow_insecure_retry=True)
             audio = streams.get('audioStreams') or []
@@ -524,7 +581,7 @@ def fetch_via_piped(query):
             )
             best = None
             last_stream_err = None
-            for cand in candidates[:8]:
+            for cand in candidates[:MAX_PIPED_STREAMS]:
                 try:
                     preflight_stream(cand['url'], label='piped ' + inst)
                     best = cand
@@ -843,6 +900,8 @@ def fetch_spotify_info(url):
 
 def _detect_url_type(q):
     q = clean_query(q)
+    if _is_video_id(q):
+        return 'youtube'
     if not re.match(r'https?://', q):
         return 'search'
     if is_youtube_url(q):
@@ -859,89 +918,94 @@ async def fetch_track(query):
 
     def _run():
         q = clean_query(query)
+        cached = _cached_track(q)
+        if cached:
+            return cached
         url_type = _detect_url_type(q)
         errors = []
 
         if url_type == 'soundcloud':
-            for fn, name in [
+            providers = [
                 (fetch_via_soundcloud, 'soundcloud'),
                 (fetch_via_ytdlp_direct, 'yt-dlp'),
                 (fetch_via_ytdlp_cookies, 'ytdlp+cookies'),
-            ]:
-                try:
-                    return fn(q)
-                except Exception as e:
-                    errors.append(name + ': ' + str(e))
-            raise RuntimeError(' | '.join(errors))
+            ]
+            return _remember_track(q, run_provider_race(q, providers, timeout=12))
 
         if url_type == 'spotify':
             try:
                 search_q, sp_title, sp_thumb = fetch_spotify_info(q)
                 log.info('spotify → %s', search_q)
-                for fn, name in [
+                providers = [
+                    (fetch_via_ytdlp_direct, 'yt-dlp'),
+                    (fetch_via_soundcloud, 'soundcloud'),
+                    (fetch_via_piped, 'piped'),
                     (fetch_via_innertube, 'innertube'),
                     (fetch_via_ytdlp_cookies, 'ytdlp+cookies'),
-                    (fetch_via_ytdlp_direct, 'yt-dlp'),
-                    (fetch_via_piped, 'piped'),
-                    (fetch_via_pytubefix, 'pytubefix'),
-                    (fetch_via_invidious, 'invidious'),
-                ]:
-                    try:
-                        result = fn(search_q)
-                        if not result.get('thumbnail') and sp_thumb:
-                            result['thumbnail'] = sp_thumb
-                        result['webpage_url'] = q
-                        result['query'] = query
-                        return result
-                    except Exception as e:
-                        errors.append(name + ': ' + str(e))
+                ]
+                try:
+                    result = run_provider_race(search_q, providers)
+                except Exception as e:
+                    errors.append(str(e))
+                    result = run_provider_race(search_q, [
+                        (fetch_via_pytubefix, 'pytubefix'),
+                        (fetch_via_invidious, 'invidious'),
+                    ], timeout=12)
+                if not result.get('thumbnail') and sp_thumb:
+                    result['thumbnail'] = sp_thumb
+                result['webpage_url'] = q
+                result['query'] = query
+                return _remember_track(q, result)
             except Exception as e:
                 errors.append('spotify_scrape: ' + str(e))
             raise RuntimeError(' | '.join(errors))
 
         if url_type == 'youtube':
-            # Prefer direct YouTube resolvers, but verify ffmpeg can really open the URL.
-            for fn, name in [
-                (fetch_via_innertube, 'innertube'),
-                (fetch_via_ytdlp_cookies, 'ytdlp+cookies'),
+            providers = [
                 (fetch_via_ytdlp_direct, 'yt-dlp'),
                 (fetch_via_piped, 'piped'),
-                (fetch_via_pytubefix, 'pytubefix'),
-                (fetch_via_invidious, 'invidious'),
-                (fetch_via_yt_to_soundcloud, 'yt->soundcloud'),
-            ]:
-                try:
-                    return fn(q)
-                except Exception as e:
-                    errors.append(name + ': ' + str(e))
+                (fetch_via_innertube, 'innertube'),
+                (fetch_via_ytdlp_cookies, 'ytdlp+cookies'),
+            ]
+            try:
+                return _remember_track(q, run_provider_race(q, providers))
+            except Exception as e:
+                errors.append(str(e))
+            try:
+                return _remember_track(q, run_provider_race(q, [
+                    (fetch_via_pytubefix, 'pytubefix'),
+                    (fetch_via_invidious, 'invidious'),
+                ], timeout=12))
+            except Exception as e:
+                errors.append(str(e))
+            try:
+                return _remember_track(q, fetch_via_yt_to_soundcloud(q))
+            except Exception as e:
+                errors.append('yt->soundcloud: ' + str(e))
             raise RuntimeError(' | '.join(errors))
 
         if url_type == 'other_url':
-            for fn, name in [
+            providers = [
                 (fetch_via_ytdlp_direct, 'yt-dlp'),
                 (fetch_via_ytdlp_cookies, 'ytdlp+cookies'),
-            ]:
-                try:
-                    return fn(q)
-                except Exception as e:
-                    errors.append(name + ': ' + str(e))
-            raise RuntimeError(' | '.join(errors))
+            ]
+            return _remember_track(q, run_provider_race(q, providers, timeout=12))
 
-        # Search query: SoundCloud first, then direct/proxy YouTube resolvers.
-        for fn, name in [
+        providers = [
+            (fetch_via_ytdlp_direct, 'yt-dlp'),
             (fetch_via_soundcloud, 'soundcloud'),
+            (fetch_via_piped, 'piped'),
             (fetch_via_innertube, 'innertube'),
             (fetch_via_ytdlp_cookies, 'ytdlp+cookies'),
-            (fetch_via_ytdlp_direct, 'yt-dlp'),
-            (fetch_via_piped, 'piped'),
+        ]
+        try:
+            return _remember_track(q, run_provider_race(q, providers))
+        except Exception as e:
+            errors.append(str(e))
+        return _remember_track(q, run_provider_race(q, [
             (fetch_via_pytubefix, 'pytubefix'),
             (fetch_via_invidious, 'invidious'),
-        ]:
-            try:
-                return fn(q)
-            except Exception as e:
-                errors.append(name + ': ' + str(e))
-        raise RuntimeError(' | '.join(errors))
+        ], timeout=12))
 
     return await loop.run_in_executor(None, _run)
 
@@ -1001,6 +1065,50 @@ def make_np_embed(track, guild_id=None):
     if track.get('thumbnail'):
         embed.set_thumbnail(url=track['thumbnail'])
     return embed
+
+
+class SpotifyImportModal(discord.ui.Modal, title='Spotify playlist sync'):
+    playlist_name = discord.ui.TextInput(
+        label='ชื่อ playlist ในบอท',
+        placeholder='เว้นว่างไว้เพื่อใช้ชื่อจาก Spotify',
+        required=False,
+        max_length=40,
+    )
+    spotify_url = discord.ui.TextInput(
+        label='Spotify playlist/album link',
+        placeholder='https://open.spotify.com/playlist/... หรือ /album/...',
+        required=True,
+        max_length=500,
+    )
+
+    def __init__(self):
+        super().__init__(timeout=180)
+
+    async def on_submit(self, i: discord.Interaction):
+        url = str(self.spotify_url.value).strip()
+        name = str(self.playlist_name.value).strip()
+        if not ('spotify.com/playlist' in url or 'spotify.com/album' in url):
+            await i.response.send_message('❌ ใส่ลิงก์ Spotify playlist/album เท่านั้น', ephemeral=True)
+            return
+
+        await i.response.defer(ephemeral=True, thinking=True)
+        loop = asyncio.get_event_loop()
+        try:
+            src_name, tracks = await loop.run_in_executor(
+                None, lambda: pl.import_spotify_playlist(url)
+            )
+            display_name = (name or src_name or 'Spotify').strip()[:40]
+            saved = pl.set_tracks(i.user.id, display_name.lower(), display_name, tracks)
+        except Exception as e:
+            await i.followup.send('❌ sync Spotify ไม่สำเร็จ: ' + str(e)[:300], ephemeral=True)
+            return
+
+        await i.followup.send(
+            '✅ sync **' + saved['name'] + '** จาก Spotify แล้ว — '
+            + str(len(saved['tracks'])) + ' เพลง\n'
+            + 'เล่นได้ด้วย `!pl play ' + saved['name'] + '`',
+            ephemeral=True,
+        )
 
 
 class PlayerView(discord.ui.View):
@@ -1072,6 +1180,10 @@ class PlayerView(discord.ui.View):
             await i.followup.send('⏹️ หยุดและออกจาก voice', ephemeral=True)
         else:
             await i.followup.send('❌ บอทไม่ได้อยู่ใน voice', ephemeral=True)
+
+    @discord.ui.button(emoji='🟢', label='Spotify Sync', style=discord.ButtonStyle.success, custom_id='spotify_sync')
+    async def spotify_sync_btn(self, i: discord.Interaction, b):
+        await i.response.send_modal(SpotifyImportModal())
 
 
 async def ensure_voice(ctx):
