@@ -290,6 +290,41 @@ BAD_MUSIC_VARIANTS = (
     r'\bchipmunk\b',
     r'\btiktok\b',
     r'\bdj\s+(?:remix|edit|version)\b',
+    r'伴奏(?:版)?',
+    r'节奏(?:版)?',
+    r'節奏(?:版)?',
+    r'纯音乐',
+    r'純音樂',
+    r'翻唱',
+    r'改编',
+    r'改編',
+    r'混音(?:版)?',
+    r'重混',
+    r'加速(?:版)?',
+    r'減速(?:版)?',
+    r'减速(?:版)?',
+    r'慢速(?:版)?',
+    r'快版',
+    r'慢版',
+    r'现场(?:版)?',
+    r'現場(?:版)?',
+    r'演唱会',
+    r'演唱會',
+    r'卡拉\s*ok',
+    r'剪辑版',
+    r'剪輯版',
+    r'铃声版',
+    r'鈴聲版',
+    r'dj版',
+    r'リミックス',
+    r'カラオケ',
+    r'歌ってみた',
+    r'ライブ',
+    r'インスト',
+    r'커버',
+    r'리믹스',
+    r'라이브',
+    r'노래방',
 )
 
 NON_SONG_HINTS = (
@@ -811,6 +846,7 @@ def fetch_youtube_candidate(candidate, original_query):
     url = candidate['webpage_url']
     providers = [
         (fetch_via_piped, 'piped'),
+        (fetch_via_invidious, 'invidious'),
         (fetch_via_innertube, 'innertube'),
         (fetch_via_ytdlp_cookies, 'ytdlp+cookies'),
         (fetch_via_ytdlp_direct, 'yt-dlp'),
@@ -837,7 +873,7 @@ def fetch_strict_music_track(track):
     errors = []
     for query in strict_music_queries(track):
         try:
-            for candidate in youtube_music_search_candidates(query, limit=8):
+            for candidate in youtube_music_search_candidates(query, limit=12):
                 video_id = candidate.get('video_id')
                 if video_id and video_id not in seen:
                     seen.add(video_id)
@@ -865,7 +901,7 @@ def fetch_strict_music_track(track):
         [(c.get('match_score'), c.get('title'), c.get('uploader')) for c in strict_scored[:4]],
     )
 
-    for candidate in strict_scored[:5]:
+    for candidate in strict_scored[:10]:
         try:
             result = fetch_youtube_candidate(candidate, original_query)
             ok, score = acceptable_music_match(track, result)
@@ -882,7 +918,7 @@ def fetch_strict_music_track(track):
         track.get('title'),
         [(c.get('match_score'), c.get('title'), c.get('uploader')) for c in relaxed_scored[:4]],
     )
-    for candidate in relaxed_scored[:5]:
+    for candidate in relaxed_scored[:10]:
         try:
             result = fetch_youtube_candidate(candidate, original_query)
             ok, score = relaxed_music_match(track, result)
@@ -894,6 +930,19 @@ def fetch_strict_music_track(track):
         except Exception as e:
             errors.append((candidate.get('title') or '?') + ': ' + str(e))
             log.warning('relaxed candidate failed %s: %s', candidate.get('webpage_url'), e)
+
+    for query in strict_music_queries(track)[-2:]:
+        try:
+            result = fetch_via_soundcloud(query)
+            ok, score = relaxed_music_match(track, result)
+            if not ok:
+                raise RuntimeError('soundcloud mismatch score=' + str(score) + ' title=' + str(result.get('title')))
+            result['resolved_match_score'] = score
+            result['resolved_soundcloud_fallback'] = True
+            return _remember_track(cache_key, result)
+        except Exception as e:
+            errors.append('soundcloud ' + query + ': ' + str(e))
+            log.warning('soundcloud final fallback failed %s: %s', query, e)
 
     raise RuntimeError('หาเพลงที่ใกล้กับ Spotify ไม่เจอ: ' + ' | '.join(errors[-4:]))
 
