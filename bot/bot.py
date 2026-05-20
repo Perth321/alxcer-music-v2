@@ -251,7 +251,10 @@ def search_candidates(title, uploader=None, original=None):
 
 def search_terms(text):
     text = simplify_music_search(text)
-    terms = re.findall(r'[A-Za-z0-9]+|[\u0e00-\u0e7f]+', text)
+    terms = re.findall(
+        r'[A-Za-z0-9]+|[\u0e00-\u0e7f]+|[\u3040-\u30ff]+|[\u3400-\u4dbf\u4e00-\u9fff]+|[\uac00-\ud7af]+',
+        text,
+    )
     return [t.casefold() for t in terms if len(t.strip()) >= 2]
 
 
@@ -393,6 +396,28 @@ def acceptable_music_match(expected, candidate):
         if not any(term in candidate_title for term in title_terms):
             return False, score
     return score >= 26, score
+
+
+def relaxed_music_match(expected, candidate):
+    title = candidate.get('title') or ''
+    uploader = candidate.get('uploader') or candidate.get('uploaderName') or ''
+    score = music_match_score(expected, title, uploader, candidate.get('duration') or 0)
+    candidate_all = normalize_search_text(title + ' ' + uploader).casefold()
+    wanted_all = normalize_search_text(
+        (expected.get('title') or '') + ' ' + (expected.get('uploader') or '')
+    ).casefold()
+    if unwanted_variant(candidate_all, wanted_all):
+        return False, score
+    for pattern in NON_SONG_HINTS:
+        if _contains_pattern(candidate_all, pattern) and not _contains_pattern(wanted_all, pattern):
+            return False, score
+
+    title_terms = search_terms(expected.get('title') or expected.get('query') or '')
+    if not title_terms:
+        return score >= 12, score
+    candidate_title = normalize_search_text(title).casefold()
+    matched = sum(1 for term in title_terms if term in candidate_title)
+    return matched > 0 and score >= 8, score
 
 
 def _is_video_id(value):
@@ -820,20 +845,27 @@ def fetch_strict_music_track(track):
         except Exception as e:
             errors.append(query + ': ' + str(e))
 
-    scored = []
+    strict_scored = []
+    relaxed_scored = []
     for candidate in candidates:
         ok, score = acceptable_music_match(track, candidate)
         candidate['match_score'] = score
         if ok:
-            scored.append(candidate)
-    scored.sort(key=lambda c: c.get('match_score', 0), reverse=True)
+            strict_scored.append(candidate)
+        else:
+            relaxed_ok, relaxed_score = relaxed_music_match(track, candidate)
+            candidate['match_score'] = relaxed_score
+            if relaxed_ok:
+                relaxed_scored.append(candidate)
+    strict_scored.sort(key=lambda c: c.get('match_score', 0), reverse=True)
+    relaxed_scored.sort(key=lambda c: c.get('match_score', 0), reverse=True)
     log.info(
         'strict music candidates for %s: %s',
         track.get('title'),
-        [(c.get('match_score'), c.get('title'), c.get('uploader')) for c in scored[:4]],
+        [(c.get('match_score'), c.get('title'), c.get('uploader')) for c in strict_scored[:4]],
     )
 
-    for candidate in scored[:5]:
+    for candidate in strict_scored[:5]:
         try:
             result = fetch_youtube_candidate(candidate, original_query)
             ok, score = acceptable_music_match(track, result)
@@ -845,7 +877,25 @@ def fetch_strict_music_track(track):
             errors.append((candidate.get('title') or '?') + ': ' + str(e))
             log.warning('strict candidate failed %s: %s', candidate.get('webpage_url'), e)
 
-    raise RuntimeError('no official/original match: ' + ' | '.join(errors[-4:]))
+    log.info(
+        'relaxed music candidates for %s: %s',
+        track.get('title'),
+        [(c.get('match_score'), c.get('title'), c.get('uploader')) for c in relaxed_scored[:4]],
+    )
+    for candidate in relaxed_scored[:5]:
+        try:
+            result = fetch_youtube_candidate(candidate, original_query)
+            ok, score = relaxed_music_match(track, result)
+            if not ok:
+                raise RuntimeError('resolved mismatch score=' + str(score) + ' title=' + str(result.get('title')))
+            result['resolved_match_score'] = score
+            result['resolved_relaxed_match'] = True
+            return _remember_track(cache_key, result)
+        except Exception as e:
+            errors.append((candidate.get('title') or '?') + ': ' + str(e))
+            log.warning('relaxed candidate failed %s: %s', candidate.get('webpage_url'), e)
+
+    raise RuntimeError('หาเพลงที่ใกล้กับ Spotify ไม่เจอ: ' + ' | '.join(errors[-4:]))
 
 
 def fetch_via_piped(query):
