@@ -315,7 +315,13 @@ BAD_MUSIC_VARIANTS = (
     r'剪輯版',
     r'铃声版',
     r'鈴聲版',
-    r'dj版',
+    r'dj\s*(?:版|完整版|完)?',
+    r'抖音',
+    r'咚鼓',
+    r'越南鼓',
+    r'合唱版',
+    r'串烧',
+    r'串燒',
     r'リミックス',
     r'カラオケ',
     r'歌ってみた',
@@ -708,6 +714,60 @@ def fetch_via_soundcloud(query):
     raise RuntimeError('no playable SC result: ' + ' | '.join(errors[-3:]))
 
 
+def soundcloud_search_candidates(query, limit=20):
+    cid = get_soundcloud_client_id()
+    url = (
+        'https://api-v2.soundcloud.com/search/tracks?q='
+        + urllib.parse.quote(clean_query(query))
+        + '&limit=' + str(limit)
+        + '&client_id=' + cid
+    )
+    data = http_get_json(url, timeout=10)
+    out = []
+    seen = set()
+    for t in data.get('collection') or []:
+        if not t.get('streamable'):
+            continue
+        track_url = t.get('permalink_url')
+        if not track_url or track_url in seen:
+            continue
+        seen.add(track_url)
+        out.append({
+            'webpage_url': track_url,
+            'title': t.get('title', 'Unknown'),
+            'duration': int((t.get('duration') or 0) / 1000),
+            'thumbnail': t.get('artwork_url'),
+            'uploader': (t.get('user') or {}).get('username', 'SoundCloud'),
+            'source': 'soundcloud-search',
+        })
+    return out
+
+
+def fetch_soundcloud_candidate(candidate, original_query):
+    opts = {
+        'format': 'bestaudio/best',
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': True,
+        'source_address': '0.0.0.0',
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(candidate['webpage_url'], download=False)
+    if 'entries' in info:
+        info = info['entries'][0]
+    if not info.get('url'):
+        raise RuntimeError('no stream url')
+    return {
+        'url': info['url'],
+        'title': info.get('title') or candidate.get('title') or 'Unknown',
+        'duration': info.get('duration') or candidate.get('duration') or 0,
+        'thumbnail': info.get('thumbnail') or candidate.get('thumbnail'),
+        'webpage_url': candidate['webpage_url'],
+        'uploader': info.get('uploader') or candidate.get('uploader') or 'SoundCloud',
+        'query': original_query,
+    }
+
+
 def youtube_html_search(query, n=5):
     query = clean_query(query)
     url = 'https://www.youtube.com/results?search_query=' + urllib.parse.quote(query)
@@ -822,6 +882,12 @@ def strict_music_queries(track):
         base + ' topic',
         base,
     ]
+    if title and title != base:
+        queries.extend([
+            title + ' official',
+            title + ' original',
+            title,
+        ])
     if title and artist:
         queries.append('"' + title + '" "' + artist + '"')
     seen = set()
@@ -931,9 +997,33 @@ def fetch_strict_music_track(track):
             errors.append((candidate.get('title') or '?') + ': ' + str(e))
             log.warning('relaxed candidate failed %s: %s', candidate.get('webpage_url'), e)
 
-    for query in strict_music_queries(track)[-2:]:
+    sc_candidates = []
+    sc_seen = set()
+    for query in strict_music_queries(track):
         try:
-            result = fetch_via_soundcloud(query)
+            for candidate in soundcloud_search_candidates(query, limit=25):
+                key = candidate.get('webpage_url')
+                if key and key not in sc_seen:
+                    sc_seen.add(key)
+                    sc_candidates.append(candidate)
+        except Exception as e:
+            errors.append('soundcloud search ' + query + ': ' + str(e))
+            log.warning('soundcloud search failed %s: %s', query, e)
+    sc_scored = []
+    for candidate in sc_candidates:
+        ok, score = relaxed_music_match(track, candidate)
+        candidate['match_score'] = score
+        if ok:
+            sc_scored.append(candidate)
+    sc_scored.sort(key=lambda c: c.get('match_score', 0), reverse=True)
+    log.info(
+        'soundcloud music candidates for %s: %s',
+        track.get('title'),
+        [(c.get('match_score'), c.get('title'), c.get('uploader')) for c in sc_scored[:5]],
+    )
+    for candidate in sc_scored[:10]:
+        try:
+            result = fetch_soundcloud_candidate(candidate, original_query)
             ok, score = relaxed_music_match(track, result)
             if not ok:
                 raise RuntimeError('soundcloud mismatch score=' + str(score) + ' title=' + str(result.get('title')))
@@ -941,10 +1031,10 @@ def fetch_strict_music_track(track):
             result['resolved_soundcloud_fallback'] = True
             return _remember_track(cache_key, result)
         except Exception as e:
-            errors.append('soundcloud ' + query + ': ' + str(e))
-            log.warning('soundcloud final fallback failed %s: %s', query, e)
+            errors.append((candidate.get('title') or '?') + ': ' + str(e))
+            log.warning('soundcloud candidate failed %s: %s', candidate.get('webpage_url'), e)
 
-    raise RuntimeError('หาเพลงที่ใกล้กับ Spotify ไม่เจอ: ' + ' | '.join(errors[-4:]))
+    raise RuntimeError('หาเพลงที่เล่นได้ใกล้กับ Spotify ไม่เจอ')
 
 
 def fetch_via_piped(query):
