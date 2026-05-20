@@ -14,6 +14,7 @@ import logging
 import shutil
 import subprocess
 import sys
+import importlib.util
 import playlist as pl
 
 logging.basicConfig(
@@ -156,6 +157,99 @@ def clean_query(query):
     return q
 
 
+def _is_spaced_thai_piece(token):
+    return bool(re.fullmatch(r'[\u0e00-\u0e7f]+', token or '')) and len(token) <= 4
+
+
+def _is_spaced_latin_piece(token):
+    return len(token or '') == 1 and token.isascii() and token.isalpha()
+
+
+def normalize_search_text(text):
+    """Collapse titles like 'ค น ตื่ น C l a u d e' into useful search text."""
+    text = clean_query(text)
+    text = re.sub(r'[\u200b-\u200d\ufeff]', '', text)
+    tokens = re.sub(r'\s+', ' ', text).strip().split(' ')
+    out = []
+    run = []
+    run_type = None
+
+    def flush():
+        nonlocal run, run_type
+        if run:
+            out.append(''.join(run))
+        run = []
+        run_type = None
+
+    for token in tokens:
+        if _is_spaced_latin_piece(token):
+            typ = 'latin'
+        elif _is_spaced_thai_piece(token):
+            typ = 'thai'
+        else:
+            typ = None
+
+        if typ:
+            if run and run_type != typ:
+                flush()
+            run_type = typ
+            run.append(token)
+        else:
+            flush()
+            if token:
+                out.append(token)
+    flush()
+    return re.sub(r'\s+', ' ', ' '.join(out)).strip()
+
+
+def simplify_music_search(text):
+    text = normalize_search_text(text)
+    text = re.sub(r'[\(\[][^\)\]]*(official|video|mv|lyrics?|audio|remaster|4k|hd)[^\)\]]*[\)\]]', ' ', text, flags=re.I)
+    text = re.sub(r'\b(official|music|video|mv|lyrics?|audio|remaster(?:ed)?|4k|hd)\b', ' ', text, flags=re.I)
+    text = re.sub(r'\s*[-|]\s*$', '', text)
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def search_candidates(title, uploader=None, original=None):
+    candidates = []
+    simplified = simplify_music_search(title)
+    latin_words = re.findall(r'[A-Za-z][A-Za-z0-9]{2,}', simplified)
+    has_thai = bool(re.search(r'[\u0e00-\u0e7f]', simplified))
+    if has_thai and latin_words:
+        candidates.append(' '.join(latin_words))
+    for value in (simplified, normalize_search_text(title), title, original):
+        if value:
+            candidates.append(value)
+    base = list(candidates)
+    if uploader:
+        for value in base:
+            candidates.append((value + ' ' + uploader).strip())
+    seen = set()
+    out = []
+    for value in candidates:
+        key = value.casefold()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(value)
+    return out
+
+
+def search_terms(text):
+    text = simplify_music_search(text)
+    terms = re.findall(r'[A-Za-z0-9]+|[\u0e00-\u0e7f]+', text)
+    return [t.casefold() for t in terms if len(t.strip()) >= 2]
+
+
+def score_search_result(query, title, uploader=''):
+    terms = search_terms(query)
+    haystack = normalize_search_text((title or '') + ' ' + (uploader or '')).casefold()
+    score = 0
+    for term in terms:
+        if term in haystack:
+            score += 5 if re.fullmatch(r'[a-z0-9]+', term) else 3
+    return score
+
+
 def _is_video_id(value):
     return bool(value and YOUTUBE_VIDEO_ID_RE.match(value))
 
@@ -290,26 +384,36 @@ def get_soundcloud_client_id():
 def fetch_via_soundcloud(query):
     """SoundCloud — works reliably without any auth, great for Thai music."""
     q = query.strip()
+    items = None
     if 'soundcloud.com' in q and re.match(r'https?://', q):
-        track_url = q
-        title = q.split('/')[-1].replace('-', ' ').title()
-        duration = 0
-        thumb = None
-        uploader = 'SoundCloud'
+        items = [{
+            'permalink_url': q,
+            'title': q.split('/')[-1].replace('-', ' ').title(),
+            'duration': 0,
+            'artwork_url': None,
+            'user': {'username': 'SoundCloud'},
+        }]
     else:
         cid = get_soundcloud_client_id()
         url = ('https://api-v2.soundcloud.com/search/tracks?q=' +
-               urllib.parse.quote(q) + '&limit=5&client_id=' + cid)
+               urllib.parse.quote(q) + '&limit=10&client_id=' + cid)
         data = http_get_json(url, timeout=10)
         items = [t for t in (data.get('collection') or []) if t.get('streamable')]
         if not items:
             raise RuntimeError('no SC results')
-        t = items[0]
-        track_url = t['permalink_url']
-        title = t.get('title', 'Unknown')
-        duration = int((t.get('duration') or 0) / 1000)
-        thumb = t.get('artwork_url')
-        uploader = (t.get('user') or {}).get('username', 'SoundCloud')
+        items = [
+            t for _, t in sorted(
+                enumerate(items),
+                key=lambda pair: (
+                    -score_search_result(
+                        q,
+                        pair[1].get('title', ''),
+                        (pair[1].get('user') or {}).get('username', ''),
+                    ),
+                    pair[0],
+                ),
+            )
+        ]
 
     opts = {
         'format': 'bestaudio/best',
@@ -318,22 +422,36 @@ def fetch_via_soundcloud(query):
         'noplaylist': True,
         'source_address': '0.0.0.0',
     }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(track_url, download=False)
-    if 'entries' in info:
-        info = info['entries'][0]
-    if not info.get('url'):
-        raise RuntimeError('no stream url')
-    log.info('soundcloud ok: %s', title)
-    return {
-        'url': info['url'],
-        'title': info.get('title', title),
-        'duration': info.get('duration', duration) or duration,
-        'thumbnail': info.get('thumbnail') or thumb,
-        'webpage_url': track_url,
-        'uploader': info.get('uploader', uploader) or uploader,
-        'query': query,
-    }
+    errors = []
+    for t in items[:8]:
+        track_url = t.get('permalink_url')
+        if not track_url:
+            continue
+        title = t.get('title', 'Unknown')
+        duration = int((t.get('duration') or 0) / 1000)
+        thumb = t.get('artwork_url')
+        uploader = (t.get('user') or {}).get('username', 'SoundCloud')
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(track_url, download=False)
+            if 'entries' in info:
+                info = info['entries'][0]
+            if not info.get('url'):
+                raise RuntimeError('no stream url')
+            log.info('soundcloud ok: %s', title)
+            return {
+                'url': info['url'],
+                'title': info.get('title', title),
+                'duration': info.get('duration', duration) or duration,
+                'thumbnail': info.get('thumbnail') or thumb,
+                'webpage_url': track_url,
+                'uploader': info.get('uploader', uploader) or uploader,
+                'query': query,
+            }
+        except Exception as e:
+            errors.append(title + ': ' + str(e))
+            log.warning('soundcloud candidate failed %s: %s', track_url, e)
+    raise RuntimeError('no playable SC result: ' + ' | '.join(errors[-3:]))
 
 
 def youtube_html_search(query, n=5):
@@ -531,6 +649,8 @@ def fetch_via_ytdlp(query, cookiefile=None, label='yt-dlp'):
             'Accept-Language': 'en-US,en;q=0.9',
         },
     }
+    if importlib.util.find_spec('curl_cffi'):
+        base_opts['impersonate'] = os.environ.get('YTDLP_IMPERSONATE', 'chrome')
     if cookiefile:
         base_opts['cookiefile'] = cookiefile
     target = ytdlp_target(query)
@@ -590,15 +710,22 @@ def fetch_via_yt_to_soundcloud(query):
     """
     q = clean_query(query)
     vid = extract_video_id(q)
-    search_q = q
+    title = ''
+    uploader = ''
     if vid:
         title, uploader = get_youtube_title_oembed(vid)
         if title:
-            search_q = title + (' ' + uploader if uploader else '')
-            log.info('yt->sc fallback: "%s"', search_q)
-    result = fetch_via_soundcloud(search_q)
-    result['query'] = query
-    return result
+            log.info('yt->sc fallback title: "%s"', title)
+    errors = []
+    for search_q in search_candidates(title or q, uploader=uploader, original=q):
+        try:
+            log.info('yt->sc trying: "%s"', search_q)
+            result = fetch_via_soundcloud(search_q)
+            result['query'] = query
+            return result
+        except Exception as e:
+            errors.append(search_q + ': ' + str(e))
+    raise RuntimeError('yt->soundcloud failed: ' + ' | '.join(errors[-3:]))
 
 
 def fetch_via_ytdlp_direct(query):

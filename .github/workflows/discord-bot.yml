@@ -39,7 +39,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install -r bot/requirements.txt
+          pip install --upgrade -r bot/requirements.txt
 
       - name: Write YouTube cookies (optional)
         env:
