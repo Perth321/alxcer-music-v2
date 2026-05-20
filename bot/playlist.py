@@ -29,6 +29,19 @@ MAX_TRACKS = 500
 MAX_PLAYLISTS = 20
 SPOTIFY_ENRICH_LIMIT = int(os.environ.get('SPOTIFY_ENRICH_LIMIT', '100'))
 SPOTIFY_ENRICH_WORKERS = int(os.environ.get('SPOTIFY_ENRICH_WORKERS', '8'))
+RESOLVED_TRACK_FIELDS = (
+    'play_url',
+    'resolved_title',
+    'resolved_webpage_url',
+    'resolved_uploader',
+    'resolved_source',
+    'resolved_match_score',
+    'resolved_relaxed_match',
+    'resolved_soundcloud_fallback',
+    'resolved_status',
+    'resolved_error',
+    'resolved_at',
+)
 
 _data = {'playlists': {}}
 _sha = None
@@ -183,6 +196,9 @@ def add_track(user_id, name, track):
         'preview_url': track.get('preview_url', ''),
         'explicit': bool(track.get('explicit')),
     }
+    for key in RESOLVED_TRACK_FIELDS:
+        if key in track and track.get(key) is not None:
+            entry[key] = track.get(key)
     pl['tracks'].append(entry)
     _save_async()
     return True, entry
@@ -215,7 +231,7 @@ def set_tracks(user_id, name, display_name, tracks):
 
 def track_to_queue_entry(t):
     """Convert a stored playlist track to a queue-ready dict (no stream URL yet)."""
-    return {
+    entry = {
         'title': t.get('title', 'Unknown'),
         'webpage_url': t.get('webpage_url', ''),
         'duration': t.get('duration', 0),
@@ -232,6 +248,10 @@ def track_to_queue_entry(t):
         'explicit': bool(t.get('explicit')),
         'url': None,
     }
+    for key in RESOLVED_TRACK_FIELDS:
+        if key in t and t.get(key) is not None:
+            entry[key] = t.get(key)
+    return entry
 
 
 # ─── Import detection ────────────────────────────────────────────────────────

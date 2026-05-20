@@ -69,6 +69,9 @@ STREAM_URL_TTL = int(os.environ.get('STREAM_URL_TTL', '240'))
 MAX_PIPED_INSTANCES = int(os.environ.get('MAX_PIPED_INSTANCES', '2'))
 PIPED_STREAM_INSTANCES = int(os.environ.get('PIPED_STREAM_INSTANCES', '6'))
 MAX_PIPED_STREAMS = int(os.environ.get('MAX_PIPED_STREAMS', '1'))
+SPOTIFY_PIN_ON_SYNC = os.environ.get('SPOTIFY_PIN_ON_SYNC', '1') != '0'
+SPOTIFY_PIN_LIMIT = int(os.environ.get('SPOTIFY_PIN_LIMIT', '100'))
+SPOTIFY_PIN_WORKERS = int(os.environ.get('SPOTIFY_PIN_WORKERS', '3'))
 _FETCH_CACHE = {}
 
 _cookies_env = os.environ.get('YOUTUBE_COOKIES', '')
@@ -908,23 +911,20 @@ def track_cache_key(track):
 
 
 def fetch_youtube_candidate(candidate, original_query):
-    errors = []
     url = candidate['webpage_url']
     providers = [
-        (fetch_via_piped, 'piped'),
-        (fetch_via_invidious, 'invidious'),
-        (fetch_via_innertube, 'innertube'),
-        (fetch_via_ytdlp_cookies, 'ytdlp+cookies'),
         (fetch_via_ytdlp_direct, 'yt-dlp'),
+        (fetch_via_ytdlp_cookies, 'ytdlp+cookies'),
+        (fetch_via_piped, 'piped'),
+        (fetch_via_innertube, 'innertube'),
+        (fetch_via_invidious, 'invidious'),
     ]
-    for fn, name in providers:
-        try:
-            result = fn(url)
-            result['query'] = original_query
-            return result
-        except Exception as e:
-            errors.append(name + ': ' + str(e))
-    raise RuntimeError('candidate stream failed: ' + ' | '.join(errors[-3:]))
+    try:
+        result = run_provider_race(url, providers, timeout=FETCH_RACE_TIMEOUT)
+        result['query'] = original_query
+        return result
+    except Exception as e:
+        raise RuntimeError('candidate stream failed: ' + str(e))
 
 
 def fetch_strict_music_track(track):
@@ -939,11 +939,17 @@ def fetch_strict_music_track(track):
     errors = []
     for query in strict_music_queries(track):
         try:
+            good_candidate = False
             for candidate in youtube_music_search_candidates(query, limit=12):
                 video_id = candidate.get('video_id')
                 if video_id and video_id not in seen:
                     seen.add(video_id)
                     candidates.append(candidate)
+                    ok, score = acceptable_music_match(track, candidate)
+                    if ok and score >= 20:
+                        good_candidate = True
+            if good_candidate and len(candidates) >= 3:
+                break
         except Exception as e:
             errors.append(query + ': ' + str(e))
 
@@ -1606,8 +1612,8 @@ class SpotifyImportModal(discord.ui.Modal, title='Spotify playlist sync'):
         await i.response.defer(ephemeral=True, thinking=True)
         loop = asyncio.get_event_loop()
         try:
-            src_name, tracks = await loop.run_in_executor(
-                None, lambda: pl.import_spotify_playlist(url)
+            src_name, tracks, pinned_count, failed_count = await loop.run_in_executor(
+                None, lambda: import_spotify_playlist_with_pins(url)
             )
             display_name = (name or src_name or 'Spotify').strip()[:40]
             saved = pl.set_tracks(i.user.id, display_name.lower(), display_name, tracks)
@@ -1621,6 +1627,9 @@ class SpotifyImportModal(discord.ui.Modal, title='Spotify playlist sync'):
             + 'เล่นได้ด้วย `!pl play ' + saved['name'] + '`',
             ephemeral=True,
         )
+        pin_text = pinned_summary_text(pinned_count, failed_count, len(saved['tracks']))
+        if pin_text:
+            await i.followup.send(pin_text.strip(), ephemeral=True)
 
 
 class PlayerView(discord.ui.View):
@@ -2090,6 +2099,28 @@ def _fmt_source_date(value):
     return value[:10]
 
 
+def resolved_source_from_url(url):
+    url = str(url or '').lower()
+    if 'soundcloud.com' in url:
+        return 'soundcloud'
+    if 'youtube.com/' in url or 'youtu.be/' in url:
+        return 'youtube'
+    if 'spotify.com' in url:
+        return 'spotify'
+    if 'music.apple.com' in url:
+        return 'apple'
+    return ''
+
+
+def pinned_play_url(track):
+    for key in ('play_url', 'resolved_webpage_url'):
+        url = str(track.get(key) or '').strip()
+        source = resolved_source_from_url(url)
+        if url and source not in ('spotify', 'apple'):
+            return url
+    return ''
+
+
 def merge_resolved_audio(track, fresh):
     track['url'] = fresh['url']
     track['codec'] = fresh.get('codec')
@@ -2098,23 +2129,129 @@ def merge_resolved_audio(track, fresh):
     if not track.get('thumbnail') and fresh.get('thumbnail'):
         track['thumbnail'] = fresh['thumbnail']
     track['resolved_title'] = fresh.get('title')
-    track['resolved_webpage_url'] = fresh.get('webpage_url')
+    track['resolved_uploader'] = fresh.get('uploader')
+    webpage_url = fresh.get('webpage_url')
+    if webpage_url:
+        track['resolved_webpage_url'] = webpage_url
+        source = resolved_source_from_url(webpage_url)
+        if source:
+            track['resolved_source'] = source
+        if source not in ('spotify', 'apple'):
+            track['play_url'] = webpage_url
     track['resolved_at'] = time.time()
+    track['resolved_status'] = 'pinned'
+    track['resolved_error'] = ''
     if fresh.get('resolved_match_score') is not None:
         track['resolved_match_score'] = fresh.get('resolved_match_score')
+    for key in ('resolved_relaxed_match', 'resolved_soundcloud_fallback'):
+        if fresh.get(key) is not None:
+            track[key] = fresh.get(key)
     return track
 
 
 def track_play_query(track):
     return (
-        track.get('query')
+        pinned_play_url(track)
+        or track.get('query')
         or track.get('webpage_url')
         or ((track.get('title') or '') + ' ' + (track.get('uploader') or '')).strip()
         or track.get('title')
     )
 
 
+def pin_track_for_playback(track):
+    pinned = dict(track)
+    pinned.pop('url', None)
+    pinned.pop('codec', None)
+    if pinned_play_url(pinned):
+        pinned['resolved_status'] = 'pinned'
+        pinned['resolved_error'] = ''
+        return pinned, True, False
+    try:
+        fresh = fetch_strict_music_track(pinned)
+        merge_resolved_audio(pinned, fresh)
+        pinned.pop('url', None)
+        pinned.pop('codec', None)
+        return pinned, True, False
+    except Exception as e:
+        pinned.pop('play_url', None)
+        pinned['resolved_status'] = 'failed'
+        pinned['resolved_error'] = str(e)[:240]
+        return pinned, False, True
+
+
+def pin_tracks_for_playback(tracks):
+    pinned_tracks = [dict(t) for t in tracks]
+    if not SPOTIFY_PIN_ON_SYNC:
+        return pinned_tracks, 0, 0
+
+    indexes = [
+        i for i, t in enumerate(pinned_tracks[:SPOTIFY_PIN_LIMIT])
+        if t.get('source') in ('spotify', 'apple')
+    ]
+    if not indexes:
+        return pinned_tracks, 0, 0
+
+    pinned_count = 0
+    failed_count = 0
+    max_workers = max(1, min(SPOTIFY_PIN_WORKERS, len(indexes)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(pin_track_for_playback, pinned_tracks[i]): i for i in indexes}
+        for future in concurrent.futures.as_completed(futures):
+            index = futures[future]
+            try:
+                updated, pinned_ok, failed = future.result()
+            except Exception as e:
+                updated = dict(pinned_tracks[index])
+                updated['resolved_status'] = 'failed'
+                updated['resolved_error'] = str(e)[:240]
+                pinned_ok = False
+                failed = True
+            pinned_tracks[index] = updated
+            pinned_count += 1 if pinned_ok else 0
+            failed_count += 1 if failed else 0
+    return pinned_tracks, pinned_count, failed_count
+
+
+def import_spotify_playlist_with_pins(url):
+    src_name, tracks = pl.import_spotify_playlist(url)
+    tracks, pinned_count, failed_count = pin_tracks_for_playback(tracks)
+    return src_name, tracks, pinned_count, failed_count
+
+
+def import_any_playlist_with_pins(url):
+    kind, src_name, tracks = pl.import_any(url, piped_instances)
+    if kind in ('Spotify', 'Apple Music'):
+        tracks, pinned_count, failed_count = pin_tracks_for_playback(tracks)
+    else:
+        pinned_count = 0
+        failed_count = 0
+    return kind, src_name, tracks, pinned_count, failed_count
+
+
+def pinned_summary_text(pinned_count, failed_count, total_count):
+    if not SPOTIFY_PIN_ON_SYNC:
+        return ''
+    total_count = min(total_count, SPOTIFY_PIN_LIMIT)
+    if total_count <= 0:
+        return ''
+    text = 'Pinned source: ' + str(pinned_count) + '/' + str(total_count)
+    if failed_count:
+        text += ' (' + str(failed_count) + ' will search on play)'
+    return '\n' + text
+
+
 async def resolve_track_audio(track):
+    pinned_url = pinned_play_url(track)
+    if pinned_url:
+        try:
+            fresh = await fetch_track(pinned_url)
+            return merge_resolved_audio(track, fresh)
+        except Exception as e:
+            if track.get('source') not in ('spotify', 'apple'):
+                raise
+            log.warning('pinned source failed for %r: %s', track.get('title'), e)
+
     if track.get('source') in ('spotify', 'apple'):
         loop = asyncio.get_event_loop()
         fresh = await loop.run_in_executor(None, lambda: fetch_strict_music_track(track))
@@ -2497,8 +2634,8 @@ async def pl_import(ctx, name: str, *, url: str):
     msg = await ctx.send('⏳ กำลัง import playlist เข้า **' + name + '** …')
     loop = asyncio.get_event_loop()
     try:
-        kind, src_name, tracks = await loop.run_in_executor(
-            None, lambda: pl.import_any(url, piped_instances)
+        kind, src_name, tracks, pinned_count, failed_count = await loop.run_in_executor(
+            None, lambda: import_any_playlist_with_pins(url)
         )
     except Exception as e:
         await msg.edit(content='❌ import ล้มเหลว: ' + str(e)[:300])
@@ -2515,6 +2652,10 @@ async def pl_import(ctx, name: str, *, url: str):
         'เข้า playlist **' + saved['name'] + '** เรียบร้อย — ' + str(len(saved['tracks'])) + ' เพลง\n'
         'เล่นเลย: `!pl play ' + name + '`'
     )
+    if kind in ('Spotify', 'Apple Music'):
+        pin_text = pinned_summary_text(pinned_count, failed_count, len(saved['tracks']))
+        if pin_text:
+            await ctx.send(pin_text.strip())
 
 
 @pl_group.command(name='add')
