@@ -1688,7 +1688,7 @@ async def play_playlist_track_now(ctx, member, playlist_name, index):
     return track
 
 
-async def queue_playlist_from_ui(ctx, member, playlist_name):
+async def queue_playlist_from_ui(ctx, member, playlist_name, loop_playlist=False):
     p = pl.get(member.id, playlist_name)
     if not p:
         raise RuntimeError('ไม่พบ playlist')
@@ -1698,6 +1698,14 @@ async def queue_playlist_from_ui(ctx, member, playlist_name):
     vc = await ensure_voice_for_member(ctx, member)
     queue = get_queue(ctx.guild.id)
     entries = [pl.track_to_queue_entry(t) for t in tracks]
+    if loop_playlist:
+        set_loop(ctx.guild.id, 'all')
+        queue.clear()
+        if vc.is_playing() or vc.is_paused():
+            skip_auto_next.add(ctx.guild.id)
+            vc.stop()
+            await asyncio.sleep(0.25)
+
     if vc.is_playing() or vc.is_paused():
         queue.extend(entries)
         return None, len(entries), p.get('name', playlist_name)
@@ -1845,6 +1853,25 @@ class PlaylistTracksView(discord.ui.View):
         else:
             await i.followup.send('✅ เพิ่ม **' + name + '** เข้าคิว ' + str(count) + ' เพลง', ephemeral=True)
 
+    @discord.ui.button(emoji='🔁', label='Loop Playlist', style=discord.ButtonStyle.primary, row=2)
+    async def loop_playlist_btn(self, i: discord.Interaction, b):
+        await i.response.defer(ephemeral=True, thinking=True)
+        try:
+            first, count, name = await queue_playlist_from_ui(
+                self.ctx, i.user, self.playlist_name, loop_playlist=True
+            )
+        except Exception as e:
+            await i.followup.send('❌ loop playlist ไม่ได้: ' + str(e)[:250], ephemeral=True)
+            return
+        if first:
+            await self.ctx.send(embed=make_np_embed(first, self.ctx.guild.id), view=PlayerView(self.ctx))
+        await i.followup.send('🔁 Loop **' + name + '** แล้ว — ' + str(count) + ' เพลง', ephemeral=True)
+
+    @discord.ui.button(emoji='⏹️', label='Loop Off', style=discord.ButtonStyle.secondary, row=3)
+    async def loop_off_btn(self, i: discord.Interaction, b):
+        set_loop(self.ctx.guild.id, 'off')
+        await i.response.send_message('🔁 ปิด loop แล้ว', ephemeral=True)
+
     @discord.ui.button(emoji='🟢', label='Spotify Sync', style=discord.ButtonStyle.success, row=2)
     async def spotify_btn(self, i: discord.Interaction, b):
         await i.response.send_modal(SpotifyImportModal())
@@ -1883,7 +1910,8 @@ async def pl_help(ctx):
         name='เล่น / ดู',
         value='`!pl` — เปิด UI เลือก playlist\n'
               '`!pl <ชื่อ>` — เปิด UI เลือกเพลงใน playlist\n'
-              '`!pl play <ชื่อ>` — โหลดทั้ง playlist เข้าคิว',
+              '`!pl play <ชื่อ>` — โหลดทั้ง playlist เข้าคิว\n'
+              '`!pl loop <ชื่อ>` — เล่น playlist แล้ววนทั้งชุด',
         inline=False,
     )
     embed.add_field(
@@ -1983,6 +2011,21 @@ async def pl_remove(ctx, name: str, index: int):
         await ctx.send('🗑️ ลบ **' + (res.get('title') or '?') + '** ออกจาก **' + name + '** แล้ว')
     else:
         await ctx.send('❌ ' + res)
+
+
+@pl_group.command(name='loop', aliases=['repeat'])
+async def pl_loop(ctx, *, name: str):
+    if not ctx.author.voice:
+        await ctx.send('❌ เข้า voice channel ก่อนนะ!')
+        return
+    try:
+        first, count, display_name = await queue_playlist_from_ui(ctx, ctx.author, name, loop_playlist=True)
+    except Exception as e:
+        await ctx.send('❌ loop playlist ไม่ได้: ' + str(e)[:250])
+        return
+    if first:
+        await ctx.send(embed=make_np_embed(first, ctx.guild.id), view=PlayerView(ctx))
+    await ctx.send('🔁 Loop **' + display_name + '** แล้ว — ' + str(count) + ' เพลง')
 
 
 @pl_group.command(name='play')
